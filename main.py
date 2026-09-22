@@ -85,7 +85,7 @@ class Config:
 # preview model, which sees more "high demand / 503" overload than GA models. "gemini-2.5-flash"
 # is a stable, generally-available fallback with more provisioned capacity.
 GEMINI_MODEL_CANDIDATES = [
-    m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-flash-latest,gemini-2.5-flash").split(",") if m.strip()
+    m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-flash-latest,gemini-3.6-flash").split(",") if m.strip()
 ]
 
 # --------------------------------------------------------------------------
