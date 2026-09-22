@@ -38,7 +38,8 @@ from pathlib import Path
 from typing import Optional
 
 import feedparser
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -62,7 +63,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 FETCH_INTERVAL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", "3600"))
 MAX_ITEMS_PER_CYCLE = int(os.getenv("MAX_ITEMS_PER_CYCLE", "5"))
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+# gemini-2.5-flash has been retired for new users (as of Sep 2026). Using the
+# model Google's own API error recommends. Override via env var any time a
+# newer model (e.g. gemini-3.7-flash / gemini-3.8-flash) becomes preferable.
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.6-flash")
 
 DB_PATH = os.getenv("DB_PATH", "sent_news.db")
 
@@ -99,14 +103,25 @@ ALLOWED_KEYWORDS = [
     "health", "vaccine", "education", "digital india", "startup",
 ]
 
-# Topics that must be BLOCKED even if an allowed keyword is also present.
+# Topics that must be BLOCKED even if an allowed keyword is also present
+# (checked across title + summary).
 BLOCKED_KEYWORDS = [
-    "election", "poll", "vote bank", "campaign rally", "political party",
-    "congress party", "bjp slam", "opposition slam", "criticise", "criticize",
+    "election", "poll", "vote bank", "campaign rally", "campaign trail",
+    "political party", "party workers", "congress party", "bjp slam",
+    "opposition slam", "criticise", "criticize", "slams", "targets",
+    "accuses", "blames",
     "murder", "rape", "crime", "arrested", "assault", "riot", "clash",
     "protest turns violent", "gossip", "bollywood", "celebrity", "affair",
     "divorce", "scandal", "controversy", "debate over", "row over",
     "accident", "death toll", "terror attack", "shooting", "bomb blast",
+    # Party-politics / leader-centric coverage — statements, visits, rallies
+    # by political figures are politics even when a ministry/scheme is
+    # mentioned in passing. Extend this list with other names as needed.
+    "chief minister", "cm ", "mla", "mp elect", "symbolic march",
+    "lead a march", "party rally", "reviews progress of",
+    "amit shah", "narendra modi", "rahul gandhi", "priyanka gandhi",
+    "arvind kejriwal", "mamata banerjee", "yogi adityanath",
+    "mallikarjun kharge", "akhilesh yadav", "nitish kumar",
 ]
 
 SYSTEM_INSTRUCTION = """You are an expert UPSC/SSC/PCS current-affairs content writer.
@@ -213,16 +228,26 @@ def mark_as_sent(db_path: str, item: NewsItem) -> None:
 # ------------------------------------------------------------------------------
 
 
-def passes_topic_filter(text: str) -> bool:
-    """Strict allow/block keyword filter applied on title + summary."""
-    lowered = text.lower()
+def passes_topic_filter(title: str, summary: str) -> bool:
+    """Strict allow/block keyword filter.
+
+    - BLOCK check runs over title + summary (catch politics/crime/gossip
+      wherever it appears).
+    - ALLOW check runs over the TITLE only. Checking the summary too was
+      letting political/leader-centric stories slip through whenever the
+      summary happened to mention a ministry, scheme, or "mission" in
+      passing — the headline is a much more reliable signal of what the
+      story is actually about.
+    """
+    combined_lower = f"{title} {summary}".lower()
+    title_lower = title.lower()
 
     for blocked in BLOCKED_KEYWORDS:
-        if blocked in lowered:
+        if blocked in combined_lower:
             return False
 
     for allowed in ALLOWED_KEYWORDS:
-        if allowed in lowered:
+        if allowed in title_lower:
             return True
 
     return False  # not explicitly allowed -> skip (strict allow-list behaviour)
@@ -266,9 +291,7 @@ def filter_and_dedupe(items: list[NewsItem], db_path: str) -> list[NewsItem]:
     accepted: list[NewsItem] = []
 
     for item in items:
-        combined_text = f"{item.title} {item.summary}"
-
-        if not passes_topic_filter(combined_text):
+        if not passes_topic_filter(item.title, item.summary):
             continue
 
         if is_already_sent(db_path, item.link):
@@ -288,20 +311,13 @@ def filter_and_dedupe(items: list[NewsItem], db_path: str) -> list[NewsItem]:
 # ------------------------------------------------------------------------------
 
 
-def init_gemini() -> "genai.GenerativeModel":
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL_NAME,
-        system_instruction=SYSTEM_INSTRUCTION,
-        generation_config={
-            "response_mime_type": "application/json",
-            "temperature": 0.4,
-        },
-    )
-    return model
+def init_gemini() -> "genai.Client":
+    """Uses the current unified `google-genai` SDK (the old
+    `google-generativeai` package is deprecated / end-of-life)."""
+    return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def generate_posts(model: "genai.GenerativeModel", item: NewsItem) -> Optional[dict]:
+def generate_posts(client: "genai.Client", item: NewsItem) -> Optional[dict]:
     """Calls Gemini and returns a dict with 'english_post' and 'hindi_post',
     or None on failure."""
     user_prompt = (
@@ -313,8 +329,16 @@ def generate_posts(model: "genai.GenerativeModel", item: NewsItem) -> Optional[d
     )
 
     try:
-        response = model.generate_content(user_prompt)
-        raw_text = response.text.strip()
+        response = client.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                temperature=0.4,
+            ),
+        )
+        raw_text = (response.text or "").strip()
 
         # Safety net in case the model wraps JSON in markdown fences anyway.
         raw_text = re.sub(r"^```(?:json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
@@ -380,7 +404,7 @@ async def safe_send(bot: Bot, chat_id: str, text: str, label: str) -> bool:
 # ------------------------------------------------------------------------------
 
 
-async def run_cycle(bot: Bot, model: "genai.GenerativeModel", db_path: str) -> None:
+async def run_cycle(bot: Bot, gemini_client: "genai.Client", db_path: str) -> None:
     logger.info("=== Starting fetch cycle ===")
 
     raw_items = fetch_all_feeds()
@@ -393,7 +417,7 @@ async def run_cycle(bot: Bot, model: "genai.GenerativeModel", db_path: str) -> N
     for item in candidates:
         logger.info("Processing: %s", item.title)
 
-        posts = generate_posts(model, item)
+        posts = generate_posts(gemini_client, item)
         if posts is None:
             # Do not mark as sent -> will be retried next cycle since the
             # generation failed, not the content itself.
@@ -427,7 +451,7 @@ async def main() -> None:
     init_db(DB_PATH)
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    model = init_gemini()
+    gemini_client = init_gemini()
 
     logger.info(
         "Bot ready. Interval=%ss | Model=%s | Max items/cycle=%s",
@@ -436,7 +460,7 @@ async def main() -> None:
 
     while True:
         try:
-            await run_cycle(bot, model, DB_PATH)
+            await run_cycle(bot, gemini_client, DB_PATH)
         except Exception:
             # Top-level safety net: a single cycle's failure must never kill
             # the whole worker process.
