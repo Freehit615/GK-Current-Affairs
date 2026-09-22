@@ -18,7 +18,8 @@ import asyncpg
 import pytz
 from dotenv import load_dotenv
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 from telegram import Bot, BotCommand, Poll, Update
 from telegram.constants import ParseMode
@@ -79,7 +80,7 @@ class Config:
             logger.warning("ADMIN_IDS is empty — no one will be able to use admin commands.")
 
 
-GEMINI_MODEL_NAME = "gemini-1.5-pro"
+GEMINI_MODEL_NAME = "gemini-flash-latest"  # Google-maintained alias; always points to the current recommended Flash model
 
 # --------------------------------------------------------------------------
 # Database Layer
@@ -198,24 +199,44 @@ async def log_broadcast(target_channel: str, broadcast_type: str, status: str, d
 # Gemini AI Layer
 # --------------------------------------------------------------------------
 
-genai.configure(api_key=Config.GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=Config.GEMINI_API_KEY)
 
 
-def _get_grounded_model():
-    """Model with Google Search grounding enabled, falling back to plain model."""
+async def _generate_grounded(prompt: str) -> str:
+    """Generate content with Google Search grounding enabled, falling back to plain on error."""
     try:
-        return genai.GenerativeModel(GEMINI_MODEL_NAME, tools="google_search_retrieval")
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=GEMINI_MODEL_NAME,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
+            ),
+        )
+        return response.text.strip()
     except Exception as e:
-        logger.warning(f"Grounded model init failed ({e}); falling back to plain model.")
-        return genai.GenerativeModel(GEMINI_MODEL_NAME)
+        logger.warning(f"Grounded generation failed ({e}); retrying without grounding.")
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=prompt
+        )
+        return response.text.strip()
 
 
-def _get_json_model():
-    """Model configured to return structured JSON output."""
-    return genai.GenerativeModel(
-        GEMINI_MODEL_NAME,
-        generation_config={"response_mime_type": "application/json"},
+async def _generate_plain(prompt: str) -> str:
+    response = await asyncio.to_thread(
+        gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=prompt
     )
+    return response.text.strip()
+
+
+async def _generate_json(prompt: str) -> str:
+    response = await asyncio.to_thread(
+        gemini_client.models.generate_content,
+        model=GEMINI_MODEL_NAME,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    return response.text.strip()
 
 
 def _extract_json(text: str):
@@ -240,9 +261,7 @@ Requirements:
 - Sirf bullet points do, koi extra intro ya outro nahi chahiye.
 - Har bullet "•" se start ho.
 """
-    model = _get_grounded_model()
-    response = await asyncio.to_thread(model.generate_content, prompt)
-    return response.text.strip()
+    return await _generate_grounded(prompt)
 
 
 async def translate_to_english(hindi_text: str) -> str:
@@ -253,9 +272,7 @@ Preserve all facts, numbers, names and dates exactly.
 Hindi content:
 {hindi_text}
 """
-    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-    response = await asyncio.to_thread(model.generate_content, prompt)
-    return response.text.strip()
+    return await _generate_plain(prompt)
 
 
 async def generate_quiz(content_text: str, language: str) -> list:
@@ -281,15 +298,14 @@ Rules:
 - explanation must be under 190 characters.
 - Everything in {lang_name}.
 """
-    model = _get_json_model()
-    response = await asyncio.to_thread(model.generate_content, prompt)
+    raw_text = await _generate_json(prompt)
     try:
-        data = _extract_json(response.text)
+        data = _extract_json(raw_text)
         if isinstance(data, dict) and "questions" in data:
             data = data["questions"]
         return data
     except Exception as e:
-        logger.error(f"Failed to parse quiz JSON: {e} | raw: {response.text[:300]}")
+        logger.error(f"Failed to parse quiz JSON: {e} | raw: {raw_text[:300]}")
         return []
 
 
