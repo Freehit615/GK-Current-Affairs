@@ -81,7 +81,12 @@ class Config:
             logger.warning("ADMIN_IDS is empty — no one will be able to use admin commands.")
 
 
-GEMINI_MODEL_NAME = "gemini-flash-latest"  # Google-maintained alias; always points to the current recommended Flash model
+# Tried in order. "gemini-flash-latest" is a Google-maintained alias that currently points to a
+# preview model, which sees more "high demand / 503" overload than GA models. "gemini-2.5-flash"
+# is a stable, generally-available fallback with more provisioned capacity.
+GEMINI_MODEL_CANDIDATES = [
+    m.strip() for m in os.environ.get("GEMINI_MODELS", "gemini-flash-latest,gemini-2.5-flash").split(",") if m.strip()
+]
 
 # --------------------------------------------------------------------------
 # Database Layer
@@ -204,7 +209,7 @@ async def log_broadcast(target_channel: str, broadcast_type: str, status: str, d
 
 gemini_client = genai.Client(api_key=Config.GEMINI_API_KEY)
 
-GEMINI_MAX_RETRIES = 2
+GEMINI_MAX_RETRIES = 1  # per model; fallback happens via GEMINI_MODEL_CANDIDATES instead of in-model retries
 GEMINI_RETRY_BASE_SECONDS = 8
 
 # Free-tier guardrails (Gemini free tier as of this deployment: RPM 5, RPD 20).
@@ -256,33 +261,41 @@ async def get_gemini_usage_today() -> tuple:
 
 
 async def _call_gemini(**kwargs):
-    """Reserves a budget/rate slot, then calls generate_content with backoff retries on
-    transient errors (503/overload). Does NOT retry 429 quota-exhausted errors."""
+    """Reserves a budget/rate slot per attempt, then calls generate_content — trying each
+    model in GEMINI_MODEL_CANDIDATES in order. Falls through to the next model on transient
+    overload (503/UNAVAILABLE); a 429 quota error aborts immediately (no point retrying or
+    switching models — it's an account-level limit)."""
     last_exc = None
-    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
-        await _reserve_gemini_slot()
-        try:
-            return await asyncio.to_thread(gemini_client.models.generate_content, **kwargs)
-        except Exception as e:
-            last_exc = e
-            msg = str(e)
-            if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-                raise  # quota issue — no point retrying immediately, and it would burn another slot
-            if attempt < GEMINI_MAX_RETRIES:
-                wait = GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
-                logger.warning(f"Gemini call failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}. Retrying in {wait}s.")
-                await asyncio.sleep(wait)
+    for model_name in GEMINI_MODEL_CANDIDATES:
+        for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+            await _reserve_gemini_slot()
+            try:
+                return await asyncio.to_thread(
+                    gemini_client.models.generate_content, model=model_name, **kwargs
+                )
+            except Exception as e:
+                last_exc = e
+                msg = str(e)
+                if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+                    raise  # quota issue — no point retrying or switching models
+                if attempt < GEMINI_MAX_RETRIES:
+                    wait = GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Gemini call failed on {model_name} (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}. Retrying in {wait}s."
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.warning(f"Model {model_name} exhausted retries ({e}); trying next model if available.")
     raise last_exc
 
 
 async def _generate_plain(prompt: str) -> str:
-    response = await _call_gemini(model=GEMINI_MODEL_NAME, contents=prompt)
+    response = await _call_gemini(contents=prompt)
     return response.text.strip()
 
 
 async def _generate_json(prompt: str) -> str:
     response = await _call_gemini(
-        model=GEMINI_MODEL_NAME,
         contents=prompt,
         config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
     )
