@@ -1,477 +1,632 @@
 """
-================================================================================
- Current Affairs Telegram Bot (Hindi + English)
-================================================================================
-Har 1 ghante me verified RSS feeds se current-affairs news fetch karta hai,
-strict topic-filter (UPSC/SSC/PCS exam-relevant) apply karta hai, Gemini API
-se structured Hindi + English post banwata hai, aur do alag Telegram
-channels par bhejta hai.
-
-Deploy: Railway.app (Worker/Background service — no HTTP port needed)
-Run:    python main.py
-
-Environment Variables (Railway → Variables tab):
-    TELEGRAM_BOT_TOKEN   -> BotFather se mila token
-    HINDI_CHANNEL_ID     -> e.g. -100xxxxxxxxxx
-    ENGLISH_CHANNEL_ID   -> e.g. -100xxxxxxxxxx
-    GEMINI_API_KEY       -> Google AI Studio se mili key
-
-Optional Environment Variables:
-    FETCH_INTERVAL_SECONDS  -> default 3600 (1 hour)
-    MAX_ITEMS_PER_CYCLE     -> default 5 (kitni news per cycle process hongi)
-    LOG_LEVEL               -> default INFO
-================================================================================
+Production-grade Telegram Current Affairs Automation Bot
+Stack: python-telegram-bot v20+, Google Generative AI (Gemini), Neon PostgreSQL (asyncpg), APScheduler
+Deploy: Railway
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
+import random
 import re
-import sqlite3
-import sys
-from contextlib import closing
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
+import signal
+from datetime import datetime, timedelta
 from typing import Optional
 
-import feedparser
-from google import genai
-from google.genai import types as genai_types
-from telegram import Bot
+import asyncpg
+import pytz
+from dotenv import load_dotenv
+
+import google.generativeai as genai
+
+from telegram import Bot, BotCommand, Poll, Update
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ------------------------------------------------------------------------------
-# 1. CONFIGURATION
-# ------------------------------------------------------------------------------
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# --------------------------------------------------------------------------
+# Config & Logging
+# --------------------------------------------------------------------------
+
+load_dotenv()
+
 logging.basicConfig(
-    level=LOG_LEVEL,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    level=logging.INFO,
 )
-logger = logging.getLogger("current-affairs-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+logger = logging.getLogger("current_affairs_bot")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-HINDI_CHANNEL_ID = os.getenv("HINDI_CHANNEL_ID")
-ENGLISH_CHANNEL_ID = os.getenv("ENGLISH_CHANNEL_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+IST = pytz.timezone("Asia/Kolkata")
 
-FETCH_INTERVAL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", "3600"))
-MAX_ITEMS_PER_CYCLE = int(os.getenv("MAX_ITEMS_PER_CYCLE", "5"))
-# gemini-2.5-flash has been retired for new users (as of Sep 2026). Using the
-# model Google's own API error recommends. Override via env var any time a
-# newer model (e.g. gemini-3.7-flash / gemini-3.8-flash) becomes preferable.
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.6-flash")
 
-DB_PATH = os.getenv("DB_PATH", "sent_news.db")
+class Config:
+    TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    DATABASE_URL = os.environ.get("DATABASE_URL", "")
+    ADMIN_IDS = {
+        int(x.strip())
+        for x in os.environ.get("ADMIN_IDS", "").split(",")
+        if x.strip().lstrip("-").isdigit()
+    }
+    HINDI_CHANNEL_ID = os.environ.get("HINDI_CHANNEL_ID", "")
+    ENGLISH_CHANNEL_ID = os.environ.get("ENGLISH_CHANNEL_ID", "")
+    HINDI_QUIZ_CHANNEL_ID = os.environ.get("HINDI_QUIZ_CHANNEL_ID", "")
+    ENGLISH_QUIZ_CHANNEL_ID = os.environ.get("ENGLISH_QUIZ_CHANNEL_ID", "")
 
-REQUIRED_ENV_VARS = {
-    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-    "HINDI_CHANNEL_ID": HINDI_CHANNEL_ID,
-    "ENGLISH_CHANNEL_ID": ENGLISH_CHANNEL_ID,
-    "GEMINI_API_KEY": GEMINI_API_KEY,
-}
+    @classmethod
+    def validate(cls):
+        missing = [
+            name
+            for name in (
+                "TELEGRAM_BOT_TOKEN",
+                "GEMINI_API_KEY",
+                "DATABASE_URL",
+                "HINDI_CHANNEL_ID",
+                "ENGLISH_CHANNEL_ID",
+                "HINDI_QUIZ_CHANNEL_ID",
+                "ENGLISH_QUIZ_CHANNEL_ID",
+            )
+            if not getattr(cls, name)
+        ]
+        if missing:
+            raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+        if not cls.ADMIN_IDS:
+            logger.warning("ADMIN_IDS is empty — no one will be able to use admin commands.")
 
-# RSS feeds — verified / reliable sources only.
-# NOTE: RSS endpoints change over time. Verify these are live before deploying;
-# swap/add feeds here without touching any other logic.
-RSS_FEEDS = [
-    {"name": "PIB - English Releases", "url": "https://pib.gov.in/rss/lreleng.xml"},
-    {"name": "The Hindu - National", "url": "https://www.thehindu.com/news/national/feeder/default.rss"},
-    {"name": "The Hindu - Sci-Tech", "url": "https://www.thehindu.com/sci-tech/feeder/default.rss"},
-    {"name": "The Hindu - International", "url": "https://www.thehindu.com/news/international/feeder/default.rss"},
-    {"name": "PIB - Science & Technology", "url": "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3"},
-]
 
-# Topics that are STRICTLY allowed (exam-focused, positive/neutral news only).
-ALLOWED_KEYWORDS = [
-    "isro", "space", "satellite", "chandrayaan", "gaganyaan", "mission",
-    "science", "technology", "research", "innovation", "ai ", "artificial intelligence",
-    "environment", "climate", "wildlife", "biodiversity", "conservation",
-    "government scheme", "yojana", "policy", "ministry", "cabinet approves",
-    "economy", "gdp", "rbi", "budget", "inflation", "trade", "export", "import",
-    "sports", "olympic", "asian games", "world cup", "medal", "record",
-    "appointment", "appointed", "chairman", "committee", "summit", "agreement",
-    "mou", "treaty", "united nations", "g20", "un ", "who ", "unesco",
-    "award", "rank", "index", "report released", "launch", "inaugurat",
-    "infrastructure", "railway", "defence", "defense", "navy", "air force", "army",
-    "health", "vaccine", "education", "digital india", "startup",
-]
+GEMINI_MODEL_NAME = "gemini-1.5-pro"
 
-# Topics that must be BLOCKED even if an allowed keyword is also present
-# (checked across title + summary).
-BLOCKED_KEYWORDS = [
-    "election", "poll", "vote bank", "campaign rally", "campaign trail",
-    "political party", "party workers", "congress party", "bjp slam",
-    "opposition slam", "criticise", "criticize", "slams", "targets",
-    "accuses", "blames",
-    "murder", "rape", "crime", "arrested", "assault", "riot", "clash",
-    "protest turns violent", "gossip", "bollywood", "celebrity", "affair",
-    "divorce", "scandal", "controversy", "debate over", "row over",
-    "accident", "death toll", "terror attack", "shooting", "bomb blast",
-    # Party-politics / leader-centric coverage — statements, visits, rallies
-    # by political figures are politics even when a ministry/scheme is
-    # mentioned in passing. Extend this list with other names as needed.
-    "chief minister", "cm ", "mla", "mp elect", "symbolic march",
-    "lead a march", "party rally", "reviews progress of",
-    "amit shah", "narendra modi", "rahul gandhi", "priyanka gandhi",
-    "arvind kejriwal", "mamata banerjee", "yogi adityanath",
-    "mallikarjun kharge", "akhilesh yadav", "nitish kumar",
-]
+# --------------------------------------------------------------------------
+# Database Layer
+# --------------------------------------------------------------------------
 
-SYSTEM_INSTRUCTION = """You are an expert UPSC/SSC/PCS current-affairs content writer.
-You will receive a raw news headline and summary. Your job is to produce a
-factual, exam-oriented social-media post in BOTH English and Hindi.
+db_pool: Optional[asyncpg.Pool] = None
 
-STRICT RULES:
-1. Only cover facts relevant to competitive exams (schemes, science, environment,
-   economy, appointments, international relations, sports milestones, etc).
-2. Never include personal opinions, political bias, or sensational language.
-3. Be factually precise — mention correct ministry / mission / data / numbers
-   when available. Do not invent facts not present in the source text.
-4. Output ONLY valid JSON — no markdown fences, no extra commentary — with
-   EXACTLY these two keys: "english_post" and "hindi_post".
-5. Each post must follow this EXACT structure (keep the emoji and Telegram
-   Markdown formatting exactly as shown):
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 
-ENGLISH STRUCTURE:
-🎯 *[Catchy & Crisp Headline]*
+CREATE TABLE IF NOT EXISTS posts_history (
+    id SERIAL PRIMARY KEY,
+    channel_type TEXT NOT NULL,       -- 'hindi' | 'english'
+    message_id BIGINT,
+    post_date DATE NOT NULL,
+    content_snippet TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-📌 *Key Exam Takeaways:*
-• *Point 1:* Deep factual detail with background
-• *Point 2:* Why it matters (ministry, treaty, mission, data)
-• *Point 3:* Direct exam angle
-
-💡 *Quick Fact:* One-line crisp summary.
-
-🔗 [Source: Read Full Update]({source_url})
-
-HINDI STRUCTURE:
-🎯 *[सटीक और आकर्षक शीर्षक]*
-
-📌 *परीक्षा के मुख्य तथ्य:*
-• *बिंदु 1:* विस्तृत और प्रामाणिक पृष्ठभूमि
-• *बिंदु 2:* संबंधित मंत्रालय, मिशन, या डेटा
-• *बिंदु 3:* परीक्षा के लिए सीधा महत्व
-
-💡 *मुख्य बिंदु:* एक लाइन में सार।
-
-🔗 [स्रोत: पूरा पढ़ें]({source_url})
-
-Replace {source_url} with the actual source URL given to you. Keep the '*' bold
-markers exactly as shown since the caller sends this as Telegram Markdown.
+CREATE TABLE IF NOT EXISTS broadcast_logs (
+    id SERIAL PRIMARY KEY,
+    target_channel TEXT NOT NULL,
+    broadcast_type TEXT NOT NULL,     -- 'manual' | 'automated'
+    status TEXT NOT NULL,             -- 'success' | 'failed'
+    detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
-# ------------------------------------------------------------------------------
-# 2. DATA MODELS
-# ------------------------------------------------------------------------------
+DEFAULT_SETTINGS = {
+    "broadcast_interval_days": "1",
+    "last_broadcast_timestamp": "",
+}
 
 
-@dataclass
-class NewsItem:
-    title: str
-    summary: str
-    link: str
-    source: str
-
-
-# ------------------------------------------------------------------------------
-# 3. DEDUPLICATION STORE (SQLite)
-# ------------------------------------------------------------------------------
-
-
-def init_db(db_path: str) -> None:
-    """Create the sent_news table if it doesn't already exist."""
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sent_news (
-                url_hash   TEXT PRIMARY KEY,
-                title      TEXT,
-                link       TEXT,
-                sent_at    TEXT
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(Config.DATABASE_URL, min_size=1, max_size=5)
+    async with db_pool.acquire() as conn:
+        await conn.execute(SCHEMA_SQL)
+        for key, value in DEFAULT_SETTINGS.items():
+            await conn.execute(
+                """
+                INSERT INTO bot_settings (key, value) VALUES ($1, $2)
+                ON CONFLICT (key) DO NOTHING
+                """,
+                key,
+                value,
             )
+    logger.info("Database pool initialized and schema verified.")
+
+
+async def get_setting(key: str) -> Optional[str]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM bot_settings WHERE key = $1", key)
+        return row["value"] if row else None
+
+
+async def set_setting(key: str, value: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
             """
+            INSERT INTO bot_settings (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            key,
+            value,
         )
-        conn.commit()
-    logger.info("SQLite dedup store ready at %s", db_path)
 
 
-def hash_url(url: str) -> str:
-    return hashlib.sha256(url.strip().lower().encode("utf-8")).hexdigest()
-
-
-def is_already_sent(db_path: str, url: str) -> bool:
-    with closing(sqlite3.connect(db_path)) as conn:
-        cur = conn.execute(
-            "SELECT 1 FROM sent_news WHERE url_hash = ?", (hash_url(url),)
+async def log_post(channel_type: str, message_id: Optional[int], content_snippet: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO posts_history (channel_type, message_id, post_date, content_snippet)
+            VALUES ($1, $2, $3, $4)
+            """,
+            channel_type,
+            message_id,
+            datetime.now(IST).date(),
+            content_snippet[:500],
         )
-        return cur.fetchone() is not None
 
 
-def mark_as_sent(db_path: str, item: NewsItem) -> None:
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO sent_news (url_hash, title, link, sent_at) VALUES (?, ?, ?, ?)",
-            (hash_url(item.link), item.title, item.link, datetime.now(timezone.utc).isoformat()),
+async def get_latest_post(channel_type: str):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT * FROM posts_history
+            WHERE channel_type = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            channel_type,
         )
-        conn.commit()
 
 
-# ------------------------------------------------------------------------------
-# 4. NEWS FETCHING + FILTERING
-# ------------------------------------------------------------------------------
+async def log_broadcast(target_channel: str, broadcast_type: str, status: str, detail: str = ""):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO broadcast_logs (target_channel, broadcast_type, status, detail)
+            VALUES ($1, $2, $3, $4)
+            """,
+            target_channel,
+            broadcast_type,
+            status,
+            detail[:500],
+        )
 
 
-def passes_topic_filter(title: str, summary: str) -> bool:
-    """Strict allow/block keyword filter.
+# --------------------------------------------------------------------------
+# Gemini AI Layer
+# --------------------------------------------------------------------------
 
-    - BLOCK check runs over title + summary (catch politics/crime/gossip
-      wherever it appears).
-    - ALLOW check runs over the TITLE only. Checking the summary too was
-      letting political/leader-centric stories slip through whenever the
-      summary happened to mention a ministry, scheme, or "mission" in
-      passing — the headline is a much more reliable signal of what the
-      story is actually about.
-    """
-    combined_lower = f"{title} {summary}".lower()
-    title_lower = title.lower()
-
-    for blocked in BLOCKED_KEYWORDS:
-        if blocked in combined_lower:
-            return False
-
-    for allowed in ALLOWED_KEYWORDS:
-        if allowed in title_lower:
-            return True
-
-    return False  # not explicitly allowed -> skip (strict allow-list behaviour)
+genai.configure(api_key=Config.GEMINI_API_KEY)
 
 
-def fetch_all_feeds() -> list[NewsItem]:
-    """Pull entries from every configured RSS feed. Never raises — logs and
-    continues on a per-feed failure so one bad feed doesn't kill the cycle."""
-    items: list[NewsItem] = []
-
-    for feed_cfg in RSS_FEEDS:
-        name, url = feed_cfg["name"], feed_cfg["url"]
-        try:
-            parsed = feedparser.parse(url)
-            if parsed.bozo and not parsed.entries:
-                logger.warning("Feed '%s' could not be parsed cleanly (bozo=%s)", name, parsed.bozo_exception)
-                continue
-
-            for entry in parsed.entries:
-                title = getattr(entry, "title", "").strip()
-                summary = getattr(entry, "summary", getattr(entry, "description", "")).strip()
-                link = getattr(entry, "link", "").strip()
-
-                if not title or not link:
-                    continue
-
-                # Strip any embedded HTML tags from the summary
-                summary = re.sub(r"<[^>]+>", "", summary)
-
-                items.append(NewsItem(title=title, summary=summary, link=link, source=name))
-
-        except Exception:
-            logger.exception("Failed to fetch/parse feed '%s' (%s)", name, url)
-            continue
-
-    logger.info("Fetched %d raw entries across %d feeds", len(items), len(RSS_FEEDS))
-    return items
+def _get_grounded_model():
+    """Model with Google Search grounding enabled, falling back to plain model."""
+    try:
+        return genai.GenerativeModel(GEMINI_MODEL_NAME, tools="google_search_retrieval")
+    except Exception as e:
+        logger.warning(f"Grounded model init failed ({e}); falling back to plain model.")
+        return genai.GenerativeModel(GEMINI_MODEL_NAME)
 
 
-def filter_and_dedupe(items: list[NewsItem], db_path: str) -> list[NewsItem]:
-    accepted: list[NewsItem] = []
-
-    for item in items:
-        if not passes_topic_filter(item.title, item.summary):
-            continue
-
-        if is_already_sent(db_path, item.link):
-            continue
-
-        accepted.append(item)
-
-        if len(accepted) >= MAX_ITEMS_PER_CYCLE:
-            break
-
-    logger.info("%d item(s) passed topic-filter + dedup check", len(accepted))
-    return accepted
-
-
-# ------------------------------------------------------------------------------
-# 5. GEMINI INTEGRATION
-# ------------------------------------------------------------------------------
-
-
-def init_gemini() -> "genai.Client":
-    """Uses the current unified `google-genai` SDK (the old
-    `google-generativeai` package is deprecated / end-of-life)."""
-    return genai.Client(api_key=GEMINI_API_KEY)
-
-
-def generate_posts(client: "genai.Client", item: NewsItem) -> Optional[dict]:
-    """Calls Gemini and returns a dict with 'english_post' and 'hindi_post',
-    or None on failure."""
-    user_prompt = (
-        f"Source: {item.source}\n"
-        f"Title: {item.title}\n"
-        f"Summary: {item.summary}\n"
-        f"Source URL: {item.link}\n\n"
-        "Generate the JSON now."
+def _get_json_model():
+    """Model configured to return structured JSON output."""
+    return genai.GenerativeModel(
+        GEMINI_MODEL_NAME,
+        generation_config={"response_mime_type": "application/json"},
     )
 
+
+def _extract_json(text: str):
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    return json.loads(text)
+
+
+async def generate_current_affairs_hindi(date_str: str) -> str:
+    """Returns formatted Hindi current-affairs post body (without header)."""
+    prompt = f"""Tum ek expert current affairs editor ho jo competitive exams (UPSC, SSC, Banking, Railway, State PCS) ke liye content banate ho.
+
+Aaj ki tareekh {date_str} ke liye India aur duniya ki sabसे important, verified aur exam-relevant Current Affairs, General Knowledge (GK) aur General Studies (GS) points taiyar karo.
+
+Requirements:
+- Sirf aaj ya kal ki verified, factually accurate news use karo (search karke confirm karo).
+- 8 se 12 crisp bullet points.
+- Har bullet point exam-oriented ho — important facts, names, numbers, dates highlight karo.
+- Categories cover karo jahan relevant ho: National, International, Economy, Sports, Science & Tech, Awards, Appointments, Defence.
+- Hindi mein likho, clear aur simple bhasha mein.
+- Sirf bullet points do, koi extra intro ya outro nahi chahiye.
+- Har bullet "•" se start ho.
+"""
+    model = _get_grounded_model()
+    response = await asyncio.to_thread(model.generate_content, prompt)
+    return response.text.strip()
+
+
+async def translate_to_english(hindi_text: str) -> str:
+    prompt = f"""Translate the following Hindi current affairs bullet points into clear, accurate, exam-oriented English.
+Keep the same bullet point structure ("•" for each point). Do not add any extra commentary, intro, or outro.
+Preserve all facts, numbers, names and dates exactly.
+
+Hindi content:
+{hindi_text}
+"""
+    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+    response = await asyncio.to_thread(model.generate_content, prompt)
+    return response.text.strip()
+
+
+async def generate_quiz(content_text: str, language: str) -> list:
+    """Returns list of {question, options[4], correct_index, explanation}."""
+    lang_name = "Hindi" if language == "hindi" else "English"
+    prompt = f"""Based ONLY on the following current affairs content, create 3 multiple-choice questions in {lang_name}.
+
+Content:
+{content_text}
+
+Return ONLY a JSON array (no markdown, no extra text) in this exact format:
+[
+  {{
+    "question": "string",
+    "options": ["option1", "option2", "option3", "option4"],
+    "correct_index": 0,
+    "explanation": "short one-line explanation, max 190 characters"
+  }}
+]
+Rules:
+- Exactly 3 questions, each with exactly 4 options.
+- correct_index is 0-based index into options.
+- explanation must be under 190 characters.
+- Everything in {lang_name}.
+"""
+    model = _get_json_model()
+    response = await asyncio.to_thread(model.generate_content, prompt)
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL_NAME,
-            contents=user_prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                temperature=0.4,
-            ),
-        )
-        raw_text = (response.text or "").strip()
-
-        # Safety net in case the model wraps JSON in markdown fences anyway.
-        raw_text = re.sub(r"^```(?:json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
-
-        data = json.loads(raw_text)
-
-        if "english_post" not in data or "hindi_post" not in data:
-            logger.error("Gemini response missing required keys for '%s'", item.title)
-            return None
-
+        data = _extract_json(response.text)
+        if isinstance(data, dict) and "questions" in data:
+            data = data["questions"]
         return data
-
-    except json.JSONDecodeError:
-        logger.exception("Gemini returned invalid JSON for '%s'", item.title)
-        return None
-    except Exception:
-        logger.exception("Gemini API call failed for '%s'", item.title)
-        return None
+    except Exception as e:
+        logger.error(f"Failed to parse quiz JSON: {e} | raw: {response.text[:300]}")
+        return []
 
 
-# ------------------------------------------------------------------------------
-# 6. TELEGRAM DISPATCH
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Core Posting Workflow
+# --------------------------------------------------------------------------
+
+def build_header(dt: datetime) -> str:
+    # Format: DD Mon-YY — Current Affairs, GK & GS  (e.g. 23 Sep-26 — Current Affairs, GK & GS)
+    day = dt.strftime("%d")
+    mon = dt.strftime("%b")
+    yy = dt.strftime("%y")
+    return f"{day} {mon}-{yy} — Current Affairs, GK & GS"
 
 
-def _strip_markdown(text: str) -> str:
-    """Fallback: strip common Markdown markers so plain-text send never crashes."""
-    text = re.sub(r"[*_`]", "", text)
-    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1 (\2)", text)
-    return text
+async def run_current_affairs_flow(app: Application):
+    now_ist = datetime.now(IST)
+    date_str = now_ist.strftime("%d %B %Y")
+    header = build_header(now_ist)
 
-
-async def safe_send(bot: Bot, chat_id: str, text: str, label: str) -> bool:
-    """Sends a message with Markdown formatting; on parse failure, retries as
-    plain text so a single bad post never breaks the whole cycle."""
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=False,
-        )
-        logger.info("Sent %s post to channel %s", label, chat_id)
-        return True
-
-    except TelegramError as e:
-        logger.warning("Markdown send failed for %s (%s) — retrying as plain text", label, e)
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=_strip_markdown(text),
-                disable_web_page_preview=False,
-            )
-            logger.info("Sent %s post to channel %s (plain-text fallback)", label, chat_id)
-            return True
-        except TelegramError:
-            logger.exception("Plain-text fallback also failed for %s -> %s", label, chat_id)
-            return False
-
-
-# ------------------------------------------------------------------------------
-# 7. MAIN CYCLE
-# ------------------------------------------------------------------------------
-
-
-async def run_cycle(bot: Bot, gemini_client: "genai.Client", db_path: str) -> None:
-    logger.info("=== Starting fetch cycle ===")
-
-    raw_items = fetch_all_feeds()
-    candidates = filter_and_dedupe(raw_items, db_path)
-
-    if not candidates:
-        logger.info("No new exam-relevant news found this cycle.")
+        hindi_body = await generate_current_affairs_hindi(date_str)
+    except Exception as e:
+        logger.error(f"Gemini Hindi generation failed: {e}")
         return
 
-    for item in candidates:
-        logger.info("Processing: %s", item.title)
+    hindi_post = f"<b>{header}</b>\n\n{hindi_body}"
+    try:
+        msg = await app.bot.send_message(
+            chat_id=Config.HINDI_CHANNEL_ID, text=hindi_post, parse_mode=ParseMode.HTML
+        )
+        await log_post("hindi", msg.message_id, hindi_body)
+        logger.info("Posted Hindi current affairs.")
+    except Exception as e:
+        logger.error(f"Failed to post Hindi current affairs: {e}")
+        return
 
-        posts = generate_posts(gemini_client, item)
-        if posts is None:
-            # Do not mark as sent -> will be retried next cycle since the
-            # generation failed, not the content itself.
-            continue
+    try:
+        english_body = await translate_to_english(hindi_body)
+    except Exception as e:
+        logger.error(f"Gemini translation failed: {e}")
+        english_body = None
 
-        english_ok = await safe_send(bot, ENGLISH_CHANNEL_ID, posts["english_post"], "English")
-        hindi_ok = await safe_send(bot, HINDI_CHANNEL_ID, posts["hindi_post"], "Hindi")
+    if english_body:
+        english_post = f"<b>{header}</b>\n\n{english_body}"
+        try:
+            msg = await app.bot.send_message(
+                chat_id=Config.ENGLISH_CHANNEL_ID, text=english_post, parse_mode=ParseMode.HTML
+            )
+            await log_post("english", msg.message_id, english_body)
+            logger.info("Posted English current affairs.")
+        except Exception as e:
+            logger.error(f"Failed to post English current affairs: {e}")
 
-        if english_ok or hindi_ok:
-            # Mark sent even on partial success to avoid duplicate reposting;
-            # failures are logged above for manual follow-up.
-            mark_as_sent(db_path, item)
-
-        await asyncio.sleep(2)  # gentle pacing between Telegram API calls
-
-    logger.info("=== Cycle complete ===")
-
-
-def validate_env() -> None:
-    missing = [name for name, value in REQUIRED_ENV_VARS.items() if not value]
-    if missing:
-        logger.critical("Missing required environment variable(s): %s", ", ".join(missing))
-        sys.exit(1)
+    # Schedule quiz 5 minutes later
+    scheduler: AsyncIOScheduler = app.bot_data["scheduler"]
+    run_at = datetime.now(IST) + timedelta(minutes=5)
+    scheduler.add_job(
+        run_quiz_flow,
+        trigger="date",
+        run_date=run_at,
+        args=[app, hindi_body, english_body],
+        id=f"quiz_job_{now_ist.strftime('%Y%m%d%H%M%S')}",
+        misfire_grace_time=600,
+    )
+    logger.info(f"Quiz job scheduled for {run_at.isoformat()}")
 
 
-async def main() -> None:
-    logger.info("Booting Current Affairs Telegram Bot...")
-    validate_env()
-
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True) if Path(DB_PATH).parent != Path("") else None
-    init_db(DB_PATH)
-
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    gemini_client = init_gemini()
-
-    logger.info(
-        "Bot ready. Interval=%ss | Model=%s | Max items/cycle=%s",
-        FETCH_INTERVAL_SECONDS, GEMINI_MODEL_NAME, MAX_ITEMS_PER_CYCLE,
+async def _send_quiz_poll(app: Application, chat_id: str, q: dict):
+    options = q["options"]
+    await app.bot.send_poll(
+        chat_id=chat_id,
+        question=q["question"][:300],
+        options=[opt[:100] for opt in options],
+        type=Poll.QUIZ,
+        correct_option_id=int(q["correct_index"]),
+        explanation=(q.get("explanation") or "")[:190],
+        is_anonymous=True,
     )
 
-    while True:
-        try:
-            await run_cycle(bot, gemini_client, DB_PATH)
-        except Exception:
-            # Top-level safety net: a single cycle's failure must never kill
-            # the whole worker process.
-            logger.exception("Unhandled error during fetch cycle")
 
-        logger.info("Sleeping for %s seconds until next cycle...", FETCH_INTERVAL_SECONDS)
-        await asyncio.sleep(FETCH_INTERVAL_SECONDS)
+async def run_quiz_flow(app: Application, hindi_body: str, english_body: Optional[str]):
+    try:
+        hindi_quiz = await generate_quiz(hindi_body, "hindi")
+        for q in hindi_quiz:
+            await _send_quiz_poll(app, Config.HINDI_QUIZ_CHANNEL_ID, q)
+        logger.info(f"Posted {len(hindi_quiz)} Hindi quiz questions.")
+    except Exception as e:
+        logger.error(f"Hindi quiz flow failed: {e}")
+
+    if english_body:
+        try:
+            english_quiz = await generate_quiz(english_body, "english")
+            for q in english_quiz:
+                await _send_quiz_poll(app, Config.ENGLISH_QUIZ_CHANNEL_ID, q)
+            logger.info(f"Posted {len(english_quiz)} English quiz questions.")
+        except Exception as e:
+            logger.error(f"English quiz flow failed: {e}")
+
+
+# --------------------------------------------------------------------------
+# Broadcast Logic
+# --------------------------------------------------------------------------
+
+async def hindi_broadcast(app: Application, broadcast_type: str = "manual"):
+    row = await get_latest_post("hindi")
+    if not row:
+        await log_broadcast(Config.ENGLISH_CHANNEL_ID, broadcast_type, "failed", "No Hindi post found")
+        return False, "No Hindi post found to broadcast."
+    try:
+        if row["message_id"]:
+            await app.bot.forward_message(
+                chat_id=Config.ENGLISH_CHANNEL_ID,
+                from_chat_id=Config.HINDI_CHANNEL_ID,
+                message_id=row["message_id"],
+            )
+        else:
+            await app.bot.send_message(chat_id=Config.ENGLISH_CHANNEL_ID, text=row["content_snippet"])
+        await log_broadcast(Config.ENGLISH_CHANNEL_ID, broadcast_type, "success")
+        return True, "Hindi content broadcast to English channel."
+    except Exception as e:
+        await log_broadcast(Config.ENGLISH_CHANNEL_ID, broadcast_type, "failed", str(e))
+        return False, f"Broadcast failed: {e}"
+
+
+async def english_broadcast(app: Application, broadcast_type: str = "manual"):
+    row = await get_latest_post("english")
+    if not row:
+        await log_broadcast(Config.HINDI_CHANNEL_ID, broadcast_type, "failed", "No English post found")
+        return False, "No English post found to broadcast."
+    try:
+        if row["message_id"]:
+            await app.bot.forward_message(
+                chat_id=Config.HINDI_CHANNEL_ID,
+                from_chat_id=Config.ENGLISH_CHANNEL_ID,
+                message_id=row["message_id"],
+            )
+        else:
+            await app.bot.send_message(chat_id=Config.HINDI_CHANNEL_ID, text=row["content_snippet"])
+        await log_broadcast(Config.HINDI_CHANNEL_ID, broadcast_type, "success")
+        return True, "English content broadcast to Hindi channel."
+    except Exception as e:
+        await log_broadcast(Config.HINDI_CHANNEL_ID, broadcast_type, "failed", str(e))
+        return False, f"Broadcast failed: {e}"
+
+
+async def automated_broadcast_job(app: Application):
+    logger.info("Running automated cross-channel broadcast.")
+    await hindi_broadcast(app, broadcast_type="automated")
+    await english_broadcast(app, broadcast_type="automated")
+    await set_setting("last_broadcast_timestamp", datetime.now(IST).isoformat())
+
+
+# --------------------------------------------------------------------------
+# Scheduler Setup
+# --------------------------------------------------------------------------
+
+def schedule_next_daily_job(scheduler: AsyncIOScheduler, app: Application):
+    """Self-rescheduling daily job at a random time between 7:00-9:00 AM IST."""
+    now_ist = datetime.now(IST)
+    next_day = (now_ist + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    random_minutes = random.randint(0, 119)  # 0 to 119 minutes after 7:00 AM
+    run_at = next_day.replace(hour=7) + timedelta(minutes=random_minutes)
+
+    async def _job():
+        await run_current_affairs_flow(app)
+        schedule_next_daily_job(scheduler, app)
+
+    scheduler.add_job(
+        _job,
+        trigger="date",
+        run_date=run_at,
+        id="daily_current_affairs_job",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    logger.info(f"Next daily current affairs job scheduled for {run_at.isoformat()}")
+
+
+async def schedule_broadcast_job(scheduler: AsyncIOScheduler, app: Application, interval_days: int):
+    async def _job():
+        await automated_broadcast_job(app)
+
+    scheduler.add_job(
+        _job,
+        trigger=IntervalTrigger(days=interval_days),
+        id="automated_broadcast_job",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    logger.info(f"Automated broadcast job scheduled every {interval_days} day(s).")
+
+
+# --------------------------------------------------------------------------
+# Admin Auth Decorator
+# --------------------------------------------------------------------------
+
+def admin_only(handler):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id not in Config.ADMIN_IDS:
+            await update.message.reply_text("⛔ Permission denied. You are not authorized to use this bot.")
+            logger.warning(f"Unauthorized access attempt by user_id={user_id}")
+            return
+        return await handler(update, context)
+
+    return wrapper
+
+
+# --------------------------------------------------------------------------
+# Command Handlers
+# --------------------------------------------------------------------------
+
+@admin_only
+async def cmd_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Fetching current affairs and posting now...")
+    app = context.application
+    asyncio.create_task(run_current_affairs_flow(app))
+    await update.message.reply_text("✅ Triggered. Hindi + English posts will go out shortly, quiz follows in 5 min.")
+
+
+@admin_only
+async def cmd_hindi_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    success, message = await hindi_broadcast(context.application, broadcast_type="manual")
+    await update.message.reply_text(("✅ " if success else "❌ ") + message)
+
+
+@admin_only
+async def cmd_english_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    success, message = await english_broadcast(context.application, broadcast_type="manual")
+    await update.message.reply_text(("✅ " if success else "❌ ") + message)
+
+
+@admin_only
+async def cmd_broadcast_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit() or int(context.args[0]) < 1:
+        await update.message.reply_text("Usage: /broadcast_timer <days>  (e.g. /broadcast_timer 2)")
+        return
+    days = int(context.args[0])
+    await set_setting("broadcast_interval_days", str(days))
+    scheduler: AsyncIOScheduler = context.application.bot_data["scheduler"]
+    await schedule_broadcast_job(scheduler, context.application, days)
+    await update.message.reply_text(f"✅ Automated cross-channel broadcast interval set to every {days} day(s).")
+
+
+@admin_only
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scheduler: AsyncIOScheduler = context.application.bot_data["scheduler"]
+    interval = await get_setting("broadcast_interval_days") or "1"
+    last_broadcast = await get_setting("last_broadcast_timestamp") or "never"
+
+    daily_job = scheduler.get_job("daily_current_affairs_job")
+    broadcast_job = scheduler.get_job("automated_broadcast_job")
+
+    db_ok = True
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+    except Exception:
+        db_ok = False
+
+    lines = [
+        "<b>📊 Bot Status</b>",
+        f"Database: {'🟢 Connected' if db_ok else '🔴 Unreachable'}",
+        f"Broadcast interval: every {interval} day(s)",
+        f"Last automated broadcast: {last_broadcast}",
+        f"Next daily post: {daily_job.next_run_time.isoformat() if daily_job and daily_job.next_run_time else 'not scheduled'}",
+        f"Next broadcast: {broadcast_job.next_run_time.isoformat() if broadcast_job and broadcast_job.next_run_time else 'not scheduled'}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# --------------------------------------------------------------------------
+# Lifecycle Hooks
+# --------------------------------------------------------------------------
+
+async def post_init(app: Application):
+    Config.validate()
+    await init_db()
+
+    scheduler = AsyncIOScheduler(timezone=IST)
+    app.bot_data["scheduler"] = scheduler
+
+    interval_days = int(await get_setting("broadcast_interval_days") or "1")
+    await schedule_broadcast_job(scheduler, app, interval_days)
+    schedule_next_daily_job(scheduler, app)
+
+    scheduler.start()
+
+    await app.bot.set_my_commands(
+        [
+            BotCommand("current", "Manually trigger current affairs + quiz"),
+            BotCommand("hindi_broadcast", "Broadcast Hindi content to English channel"),
+            BotCommand("english_broadcast", "Broadcast English content to Hindi channel"),
+            BotCommand("broadcast_timer", "Set automated broadcast interval in days"),
+            BotCommand("status", "Show bot/database/scheduler status"),
+        ]
+    )
+    logger.info("Bot initialized: database ready, scheduler running, commands registered.")
+
+
+async def post_shutdown(app: Application):
+    scheduler: Optional[AsyncIOScheduler] = app.bot_data.get("scheduler")
+    if scheduler:
+        scheduler.shutdown(wait=False)
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+    logger.info("Graceful shutdown complete.")
+
+
+# --------------------------------------------------------------------------
+# Entry Point
+# --------------------------------------------------------------------------
+
+def main():
+    Config.validate()
+
+    application = (
+        Application.builder()
+        .token(Config.TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("current", cmd_current))
+    application.add_handler(CommandHandler("hindi_broadcast", cmd_hindi_broadcast))
+    application.add_handler(CommandHandler("english_broadcast", cmd_english_broadcast))
+    application.add_handler(CommandHandler("broadcast_timer", cmd_broadcast_timer))
+    application.add_handler(CommandHandler("status", cmd_status))
+
+    logger.info("Starting bot polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Shutting down (KeyboardInterrupt).")
+    main()
