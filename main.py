@@ -11,6 +11,7 @@ import os
 import random
 import re
 import signal
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -116,6 +117,8 @@ CREATE TABLE IF NOT EXISTS broadcast_logs (
 DEFAULT_SETTINGS = {
     "broadcast_interval_days": "1",
     "last_broadcast_timestamp": "",
+    "gemini_requests_date": "",
+    "gemini_requests_count": "0",
 }
 
 
@@ -201,37 +204,84 @@ async def log_broadcast(target_channel: str, broadcast_type: str, status: str, d
 
 gemini_client = genai.Client(api_key=Config.GEMINI_API_KEY)
 
+GEMINI_MAX_RETRIES = 2
+GEMINI_RETRY_BASE_SECONDS = 8
 
-async def _generate_grounded(prompt: str) -> str:
-    """Generate content with Google Search grounding enabled, falling back to plain on error."""
-    try:
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=GEMINI_MODEL_NAME,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
-            ),
-        )
-        return response.text.strip()
-    except Exception as e:
-        logger.warning(f"Grounded generation failed ({e}); retrying without grounding.")
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=prompt
-        )
-        return response.text.strip()
+# Free-tier guardrails (Gemini free tier as of this deployment: RPM 5, RPD 20).
+# Leave a safety margin below the real RPD cap since other things may share the same key/project.
+GEMINI_MAX_REQUESTS_PER_DAY = int(os.environ.get("GEMINI_MAX_REQUESTS_PER_DAY", "16"))
+GEMINI_MIN_SECONDS_BETWEEN_CALLS = int(os.environ.get("GEMINI_MIN_SECONDS_BETWEEN_CALLS", "15"))  # 15s -> max 4/min, under RPM 5
+
+_gemini_lock = asyncio.Lock()
+_last_gemini_call_monotonic = 0.0
+
+
+class GeminiBudgetExceeded(Exception):
+    """Raised when the daily Gemini free-tier request budget has been used up."""
+
+
+async def _reserve_gemini_slot():
+    """Serializes all Gemini calls: enforces the daily request budget (RPD) and a minimum
+    gap between calls (RPM), using bot_settings in Postgres so the budget survives restarts."""
+    global _last_gemini_call_monotonic
+    async with _gemini_lock:
+        today = datetime.now(IST).date().isoformat()
+        stored_date = await get_setting("gemini_requests_date")
+        if stored_date != today:
+            await set_setting("gemini_requests_date", today)
+            await set_setting("gemini_requests_count", "0")
+            count = 0
+        else:
+            count = int(await get_setting("gemini_requests_count") or "0")
+
+        if count >= GEMINI_MAX_REQUESTS_PER_DAY:
+            raise GeminiBudgetExceeded(
+                f"Daily Gemini request budget ({GEMINI_MAX_REQUESTS_PER_DAY}) already used today."
+            )
+
+        elapsed = time.monotonic() - _last_gemini_call_monotonic
+        if elapsed < GEMINI_MIN_SECONDS_BETWEEN_CALLS:
+            await asyncio.sleep(GEMINI_MIN_SECONDS_BETWEEN_CALLS - elapsed)
+
+        _last_gemini_call_monotonic = time.monotonic()
+        await set_setting("gemini_requests_count", str(count + 1))
+
+
+async def get_gemini_usage_today() -> tuple:
+    """Returns (used, limit) for today, for /status."""
+    today = datetime.now(IST).date().isoformat()
+    stored_date = await get_setting("gemini_requests_date")
+    used = int(await get_setting("gemini_requests_count") or "0") if stored_date == today else 0
+    return used, GEMINI_MAX_REQUESTS_PER_DAY
+
+
+async def _call_gemini(**kwargs):
+    """Reserves a budget/rate slot, then calls generate_content with backoff retries on
+    transient errors (503/overload). Does NOT retry 429 quota-exhausted errors."""
+    last_exc = None
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        await _reserve_gemini_slot()
+        try:
+            return await asyncio.to_thread(gemini_client.models.generate_content, **kwargs)
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+                raise  # quota issue — no point retrying immediately, and it would burn another slot
+            if attempt < GEMINI_MAX_RETRIES:
+                wait = GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                logger.warning(f"Gemini call failed (attempt {attempt}/{GEMINI_MAX_RETRIES}): {e}. Retrying in {wait}s.")
+                await asyncio.sleep(wait)
+    raise last_exc
 
 
 async def _generate_plain(prompt: str) -> str:
-    response = await asyncio.to_thread(
-        gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=prompt
-    )
+    response = await _call_gemini(model=GEMINI_MODEL_NAME, contents=prompt)
     return response.text.strip()
 
 
 async def _generate_json(prompt: str) -> str:
-    response = await asyncio.to_thread(
-        gemini_client.models.generate_content,
+    response = await _call_gemini(
         model=GEMINI_MODEL_NAME,
         contents=prompt,
         config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
@@ -246,67 +296,68 @@ def _extract_json(text: str):
     return json.loads(text)
 
 
-async def generate_current_affairs_hindi(date_str: str) -> str:
-    """Returns formatted Hindi current-affairs post body (without header)."""
+async def generate_current_affairs_bilingual(date_str: str) -> dict:
+    """Single Gemini call that returns BOTH Hindi and English bullet-point bodies,
+    to keep daily request count low on the free tier. Returns {"hindi": str, "english": str}."""
     prompt = f"""Tum ek expert current affairs editor ho jo competitive exams (UPSC, SSC, Banking, Railway, State PCS) ke liye content banate ho.
 
-Aaj ki tareekh {date_str} ke liye India aur duniya ki sabसे important, verified aur exam-relevant Current Affairs, General Knowledge (GK) aur General Studies (GS) points taiyar karo.
+Aaj ki tareekh {date_str} ke liye India aur duniya ki sabसे important, exam-relevant Current Affairs, General Knowledge (GK) aur General Studies (GS) points taiyar karo.
 
 Requirements:
-- Sirf aaj ya kal ki verified, factually accurate news use karo (search karke confirm karo).
+- Apne knowledge ke aadhar par sabसे recent aur exam-relevant events cover karo (note: real-time web search available nahi hai, isliye apne training knowledge tak ki sabसे latest verified information do).
 - 8 se 12 crisp bullet points.
 - Har bullet point exam-oriented ho — important facts, names, numbers, dates highlight karo.
 - Categories cover karo jahan relevant ho: National, International, Economy, Sports, Science & Tech, Awards, Appointments, Defence.
-- Hindi mein likho, clear aur simple bhasha mein.
-- Sirf bullet points do, koi extra intro ya outro nahi chahiye.
-- Har bullet "•" se start ho.
+- Har bullet "•" se start ho, koi extra intro/outro nahi.
+- Same content do baar do: ek Hindi mein, ek uska accurate English translation (same facts, same bullet structure).
+
+Return ONLY a JSON object, no markdown, in exactly this format:
+{{
+  "hindi": "• point 1\\n• point 2\\n...",
+  "english": "• point 1\\n• point 2\\n..."
+}}
 """
-    return await _generate_grounded(prompt)
+    raw_text = await _generate_json(prompt)
+    data = _extract_json(raw_text)
+    return {"hindi": data["hindi"].strip(), "english": data.get("english", "").strip()}
 
 
-async def translate_to_english(hindi_text: str) -> str:
-    prompt = f"""Translate the following Hindi current affairs bullet points into clear, accurate, exam-oriented English.
-Keep the same bullet point structure ("•" for each point). Do not add any extra commentary, intro, or outro.
-Preserve all facts, numbers, names and dates exactly.
+async def generate_quiz_bilingual(hindi_content: str, english_content: str) -> dict:
+    """Single Gemini call that returns quiz questions in BOTH languages.
+    Returns {"hindi_quiz": [...], "english_quiz": [...]}, each item:
+    {question, options[4], correct_index, explanation}."""
+    prompt = f"""Based ONLY on the following current affairs content, create 3 multiple-choice questions.
 
 Hindi content:
-{hindi_text}
-"""
-    return await _generate_plain(prompt)
+{hindi_content}
 
+English content:
+{english_content}
 
-async def generate_quiz(content_text: str, language: str) -> list:
-    """Returns list of {question, options[4], correct_index, explanation}."""
-    lang_name = "Hindi" if language == "hindi" else "English"
-    prompt = f"""Based ONLY on the following current affairs content, create 3 multiple-choice questions in {lang_name}.
-
-Content:
-{content_text}
-
-Return ONLY a JSON array (no markdown, no extra text) in this exact format:
-[
-  {{
-    "question": "string",
-    "options": ["option1", "option2", "option3", "option4"],
-    "correct_index": 0,
-    "explanation": "short one-line explanation, max 190 characters"
-  }}
-]
+Return ONLY a JSON object (no markdown, no extra text) in exactly this format:
+{{
+  "hindi_quiz": [
+    {{"question": "string in Hindi", "options": ["opt1","opt2","opt3","opt4"], "correct_index": 0, "explanation": "short Hindi explanation, max 190 chars"}}
+  ],
+  "english_quiz": [
+    {{"question": "string in English", "options": ["opt1","opt2","opt3","opt4"], "correct_index": 0, "explanation": "short English explanation, max 190 chars"}}
+  ]
+}}
 Rules:
-- Exactly 3 questions, each with exactly 4 options.
-- correct_index is 0-based index into options.
-- explanation must be under 190 characters.
-- Everything in {lang_name}.
+- Exactly 3 questions in each of "hindi_quiz" and "english_quiz" (6 total), covering the same facts.
+- Each question has exactly 4 options; correct_index is 0-based.
+- explanation under 190 characters.
 """
     raw_text = await _generate_json(prompt)
     try:
         data = _extract_json(raw_text)
-        if isinstance(data, dict) and "questions" in data:
-            data = data["questions"]
-        return data
+        return {
+            "hindi_quiz": data.get("hindi_quiz", []),
+            "english_quiz": data.get("english_quiz", []),
+        }
     except Exception as e:
         logger.error(f"Failed to parse quiz JSON: {e} | raw: {raw_text[:300]}")
-        return []
+        return {"hindi_quiz": [], "english_quiz": []}
 
 
 # --------------------------------------------------------------------------
@@ -327,9 +378,14 @@ async def run_current_affairs_flow(app: Application):
     header = build_header(now_ist)
 
     try:
-        hindi_body = await generate_current_affairs_hindi(date_str)
+        content = await generate_current_affairs_bilingual(date_str)
+        hindi_body = content["hindi"]
+        english_body = content.get("english") or None
+    except GeminiBudgetExceeded as e:
+        logger.warning(f"Skipping current affairs post: {e}")
+        return
     except Exception as e:
-        logger.error(f"Gemini Hindi generation failed: {e}")
+        logger.error(f"Gemini bilingual generation failed: {e}")
         return
 
     hindi_post = f"<b>{header}</b>\n\n{hindi_body}"
@@ -342,12 +398,6 @@ async def run_current_affairs_flow(app: Application):
     except Exception as e:
         logger.error(f"Failed to post Hindi current affairs: {e}")
         return
-
-    try:
-        english_body = await translate_to_english(hindi_body)
-    except Exception as e:
-        logger.error(f"Gemini translation failed: {e}")
-        english_body = None
 
     if english_body:
         english_post = f"<b>{header}</b>\n\n{english_body}"
@@ -389,21 +439,28 @@ async def _send_quiz_poll(app: Application, chat_id: str, q: dict):
 
 async def run_quiz_flow(app: Application, hindi_body: str, english_body: Optional[str]):
     try:
-        hindi_quiz = await generate_quiz(hindi_body, "hindi")
-        for q in hindi_quiz:
-            await _send_quiz_poll(app, Config.HINDI_QUIZ_CHANNEL_ID, q)
-        logger.info(f"Posted {len(hindi_quiz)} Hindi quiz questions.")
+        quiz = await generate_quiz_bilingual(hindi_body, english_body or "")
+    except GeminiBudgetExceeded as e:
+        logger.warning(f"Skipping quiz: {e}")
+        return
     except Exception as e:
-        logger.error(f"Hindi quiz flow failed: {e}")
+        logger.error(f"Quiz generation failed: {e}")
+        return
+
+    try:
+        for q in quiz.get("hindi_quiz", []):
+            await _send_quiz_poll(app, Config.HINDI_QUIZ_CHANNEL_ID, q)
+        logger.info(f"Posted {len(quiz.get('hindi_quiz', []))} Hindi quiz questions.")
+    except Exception as e:
+        logger.error(f"Posting Hindi quiz failed: {e}")
 
     if english_body:
         try:
-            english_quiz = await generate_quiz(english_body, "english")
-            for q in english_quiz:
+            for q in quiz.get("english_quiz", []):
                 await _send_quiz_poll(app, Config.ENGLISH_QUIZ_CHANNEL_ID, q)
-            logger.info(f"Posted {len(english_quiz)} English quiz questions.")
+            logger.info(f"Posted {len(quiz.get('english_quiz', []))} English quiz questions.")
         except Exception as e:
-            logger.error(f"English quiz flow failed: {e}")
+            logger.error(f"Posting English quiz failed: {e}")
 
 
 # --------------------------------------------------------------------------
@@ -523,10 +580,16 @@ def admin_only(handler):
 
 @admin_only
 async def cmd_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    used, limit = await get_gemini_usage_today()
+    if used >= limit:
+        await update.message.reply_text(
+            f"❌ Daily Gemini request budget already used ({used}/{limit}). Try again after midnight IST, "
+            f"or raise GEMINI_MAX_REQUESTS_PER_DAY if your actual quota allows more."
+        )
+        return
     await update.message.reply_text("⏳ Fetching current affairs and posting now...")
-    app = context.application
-    asyncio.create_task(run_current_affairs_flow(app))
-    await update.message.reply_text("✅ Triggered. Hindi + English posts will go out shortly, quiz follows in 5 min.")
+    await run_current_affairs_flow(context.application)
+    await update.message.reply_text("✅ Done. Hindi + English posts sent (if generation succeeded — check logs), quiz follows in 5 min.")
 
 
 @admin_only
@@ -569,9 +632,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         db_ok = False
 
+    gemini_used, gemini_limit = await get_gemini_usage_today()
+
     lines = [
         "<b>📊 Bot Status</b>",
         f"Database: {'🟢 Connected' if db_ok else '🔴 Unreachable'}",
+        f"Gemini requests today: {gemini_used}/{gemini_limit}",
         f"Broadcast interval: every {interval} day(s)",
         f"Last automated broadcast: {last_broadcast}",
         f"Next daily post: {daily_job.next_run_time.isoformat() if daily_job and daily_job.next_run_time else 'not scheduled'}",
