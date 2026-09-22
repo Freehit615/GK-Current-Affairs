@@ -1,149 +1,106 @@
-# Current Affairs Telegram Bot (Hindi + English)
+# Current Affairs Telegram Automation Bot
 
-Har 1 ghante me verified RSS feeds (PIB, The Hindu, etc.) se UPSC/SSC/PCS-relevant
-current affairs fetch karta hai, Gemini API se do bhashao (Hindi + English) me
-exam-oriented post banwata hai, aur do alag Telegram channels par bhejta hai.
-Politics, crime, gossip, elections automatically block ho jaate hain.
+Production-grade bot that auto-generates and posts daily Current Affairs / GK / GS
+content (Hindi + English) with quiz polls, plus admin-controlled cross-channel
+broadcasting. Built with `python-telegram-bot`, Gemini (Google Generative AI),
+Neon PostgreSQL (`asyncpg`), and `APScheduler`. Deploys on Railway.
 
----
+## Files
 
-## 1. Files
+- `main.py` — full bot logic (single file)
+- `requirements.txt` — pinned dependencies
+- `README.md` — this file
 
-| File               | Purpose                                              |
-|---------------------|-------------------------------------------------------|
-| `main.py`           | Poora bot logic — fetch, filter, Gemini, dispatch    |
-| `requirements.txt`  | Python dependencies                                  |
-| `README.md`         | Ye file                                              |
+## How it works
 
-Bot apni state ke liye `sent_news.db` (SQLite) khud create karega — usko
-repo me manually add karne ki zaroorat nahi.
+- **Daily post (7:00–9:00 AM IST, random time each day):** Gemini generates
+  fresh Hindi current affairs → posted to `HINDI_CHANNEL_ID` → translated to
+  English → posted to `ENGLISH_CHANNEL_ID`.
+- **Quiz (5 min later):** 2–3 MCQs per language, posted as native Telegram quiz
+  polls to `HINDI_QUIZ_CHANNEL_ID` / `ENGLISH_QUIZ_CHANNEL_ID`.
+- **Cross-broadcast:** the latest Hindi post is forwarded into the English
+  channel and vice versa, either manually via commands or automatically on an
+  admin-configurable interval (stored in Postgres, survives restarts).
 
----
+## Environment Variables
 
-## 2. Prerequisites
+| Variable | Description |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
+| `GEMINI_API_KEY` | Google Generative AI (Gemini) API key |
+| `DATABASE_URL` | Neon Postgres connection string (`postgresql://user:pass@host/db?sslmode=require`) |
+| `ADMIN_IDS` | Comma-separated Telegram numeric user IDs, e.g. `111111,222222` |
+| `HINDI_CHANNEL_ID` | Chat ID of the Hindi current-affairs channel |
+| `ENGLISH_CHANNEL_ID` | Chat ID of the English current-affairs channel |
+| `HINDI_QUIZ_CHANNEL_ID` | Chat ID for Hindi quiz polls |
+| `ENGLISH_QUIZ_CHANNEL_ID` | Chat ID for English quiz polls |
 
-1. **Telegram Bot** — [@BotFather](https://t.me/BotFather) se naya bot banao,
-   `TELEGRAM_BOT_TOKEN` copy karo.
-2. Dono channels (Hindi + English) me **bot ko admin banao** (post karne ke liye
-   "Post Messages" permission chahiye).
-3. Dono channel IDs nikalo (format: `-100xxxxxxxxxx`). Aasan tarika:
-   channel me koi message forward karo [@userinfobot](https://t.me/userinfobot) ko.
-4. **Gemini API Key** — [Google AI Studio](https://aistudio.google.com/apikey)
-   se free key generate karo.
+Channel IDs are usually negative numbers like `-1001234567890`. The bot must be
+an **admin** in every channel it posts to (post + poll permissions).
 
----
-
-## 3. Local Testing (optional)
+## Local Setup
 
 ```bash
-git clone <your-repo-url>
-cd <your-repo>
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
-
-export TELEGRAM_BOT_TOKEN="123456:ABC-your-token"
-export HINDI_CHANNEL_ID="-1001234567890"
-export ENGLISH_CHANNEL_ID="-1009876543210"
-export GEMINI_API_KEY="your-gemini-key"
-
+cp .env.example .env   # create this and fill in the variables above
 python main.py
 ```
 
-Console me structured logs dikhengi — fetch → filter → Gemini → Telegram send,
-har step ke liye.
+`.env.example`:
+```
+TELEGRAM_BOT_TOKEN=
+GEMINI_API_KEY=
+DATABASE_URL=
+ADMIN_IDS=
+HINDI_CHANNEL_ID=
+ENGLISH_CHANNEL_ID=
+HINDI_QUIZ_CHANNEL_ID=
+ENGLISH_QUIZ_CHANNEL_ID=
+```
 
----
+## Railway Deployment
 
-## 4. Deploy on Railway.app
-
-1. Is code ko apne GitHub repo me push karo (`main.py`, `requirements.txt`,
-   `README.md`).
-2. Railway.app par **New Project → Deploy from GitHub repo** select karo.
-3. Repo select karte hi Railway `requirements.txt` detect karke Python
-   environment auto-setup kar dega.
-4. **Settings → Deploy** me Start Command set karo (agar auto-detect na ho):
+1. Push these 3 files to a GitHub repo.
+2. In Railway, **New Project → Deploy from GitHub repo**, select the repo.
+3. Railway auto-detects Python. Set the **Start Command** to:
    ```
    python main.py
    ```
-5. **Variables** tab me ye 4 environment variables add karo:
+4. Go to **Variables** and add all env vars listed above (values from
+   BotFather, Google AI Studio, and your Neon dashboard).
+5. Deploy. Check **Deployments → Logs** — you should see:
+   `Bot initialized: database ready, scheduler running, commands registered.`
+6. The bot is now polling; no webhook or public URL is required.
 
-   | Key                    | Value                          |
-   |-------------------------|---------------------------------|
-   | `TELEGRAM_BOT_TOKEN`    | BotFather wala token            |
-   | `HINDI_CHANNEL_ID`      | e.g. `-1001234567890`           |
-   | `ENGLISH_CHANNEL_ID`    | e.g. `-1009876543210`           |
-   | `GEMINI_API_KEY`        | Google AI Studio wali key       |
+### Neon PostgreSQL
 
-6. **Important:** Ye ek **background worker** hai, web server nahi — isliye
-   Railway ke "Service" type ko **Worker** rakho (ya "Web" service me HTTP
-   healthcheck **disable** kar do), warna Railway PORT bind na hone par
-   service ko unhealthy maan sakta hai.
-7. Deploy karo — logs tab me "Bot ready..." message dikhna chahiye, uske
-   baad har ghante ek cycle chalega.
+- Create a free project at neon.tech, copy the pooled connection string into
+  `DATABASE_URL`.
+- Tables (`bot_settings`, `posts_history`, `broadcast_logs`) are created
+  automatically on first startup — no manual migration needed.
 
-### Optional environment variables
+## Commands (admin-only, registered in Telegram's menu button)
 
-| Key                        | Default | Purpose                                  |
-|------------------------------|---------|--------------------------------------------|
-| `FETCH_INTERVAL_SECONDS`     | `3600`  | Kitne second me ek cycle chale            |
-| `MAX_ITEMS_PER_CYCLE`        | `5`     | Ek cycle me max kitni news process ho     |
-| `GEMINI_MODEL_NAME`          | `gemini-2.5-flash` | Gemini model override         |
-| `LOG_LEVEL`                  | `INFO`  | `DEBUG` / `INFO` / `WARNING` / `ERROR`    |
-| `DB_PATH`                    | `sent_news.db` | Dedup SQLite file ka path          |
+| Command | Description |
+|---|---|
+| `/current` | Manually trigger current affairs post + quiz (5 min later) |
+| `/hindi_broadcast` | Forward latest Hindi post into the English channel now |
+| `/english_broadcast` | Forward latest English post into the Hindi channel now |
+| `/broadcast_timer <days>` | Set automated cross-broadcast interval, e.g. `/broadcast_timer 2` |
+| `/status` | Show DB connection, broadcast interval, next scheduled runs |
 
-> ⚠️ Railway ka filesystem **ephemeral** hota hai — redeploy hone par
-> `sent_news.db` reset ho sakta hai (kabhi-kabhi purani news dobara post ho
-> sakti hai). Agar ye avoid karna ho, Railway ka **Volume** attach karo aur
-> `DB_PATH` ko us volume ke andar point karo (e.g. `/data/sent_news.db`).
+All commands reply "⛔ Permission denied" for any user ID not in `ADMIN_IDS`.
 
----
+## Notes
 
-## 5. Kaise kaam karta hai (Architecture)
-
-```
-┌─────────────┐    ┌──────────────┐    ┌───────────────┐    ┌──────────────┐
-│  RSS Feeds   │ →  │ Topic Filter │ →  │   Gemini API   │ →  │   Telegram   │
-│ (PIB, Hindu) │    │ Allow/Block  │    │ EN + HI JSON   │    │  2 Channels  │
-└─────────────┘    │ + SQLite     │    └───────────────┘    └──────────────┘
-                    │   Dedup      │
-                    └──────────────┘
-```
-
-1. **Fetch** — `feedparser` se har RSS feed poll hota hai.
-2. **Filter** — allow-list keywords (science, ISRO, schemes, economy, sports,
-   appointments...) match karna zaroori hai; block-list keywords (election,
-   crime, gossip...) mile toh turant reject.
-3. **Dedup** — har news URL ka SHA-256 hash `sent_news.db` me check hota hai;
-   pehle se bheji gayi news skip ho jaati hai.
-4. **Gemini** — `gemini-2.5-flash` ko strict JSON-mode system instruction ke
-   saath call kiya jata hai; output `{"english_post": ..., "hindi_post": ...}`.
-5. **Dispatch** — dono posts respective channels par `MarkdownV1` formatting
-   ke saath bheje jaate hain; agar formatting parse fail ho, bot automatically
-   plain-text fallback try karta hai (crash nahi hota).
-6. Poora process `while True` loop me `FETCH_INTERVAL_SECONDS` (default 1hr)
-   ke gap par repeat hota hai.
-
----
-
-## 6. Customization Tips
-
-- **Feeds add/remove karna** — `main.py` me `RSS_FEEDS` list edit karo.
-- **Topics change karna** — `ALLOWED_KEYWORDS` / `BLOCKED_KEYWORDS` list edit
-  karo.
-- **Post design change karna** — `SYSTEM_INSTRUCTION` string ke andar wala
-  template edit karo (Gemini isi structure ko follow karega).
-- **Interval change karna** — `FETCH_INTERVAL_SECONDS` env var set karo, code
-  touch karne ki zaroorat nahi.
-
----
-
-## 7. Troubleshooting
-
-| Problem                                   | Likely Fix                                                        |
-|--------------------------------------------|---------------------------------------------------------------------|
-| `Missing required environment variable(s)` | Railway Variables tab me sab 4 keys check karo                     |
-| Bot message nahi bhej pa raha              | Bot ko channel me admin banao + "Post Messages" permission do      |
-| Koi news post nahi ho rahi                 | Feeds ka content allow-list keywords se match nahi ho raha ho sakta — `ALLOWED_KEYWORDS` widen karo, ya logs me `DEBUG` level set karke check karo |
-| Gemini invalid JSON error                  | Automatic — item skip hoke agle cycle me retry hota hai            |
-| Duplicate news repost ho rahi hai          | Railway volume attach karke `DB_PATH` persistent path par set karo |
+- The daily job time is randomized (0–119 min after 7:00 AM IST) and
+  re-randomizes itself for the next day after each run, so it never becomes
+  predictable.
+- Broadcast interval changes take effect immediately — no restart needed.
+- If Gemini's Google Search grounding tool is unavailable for your API key/
+  region, the bot automatically falls back to a plain (non-grounded) model
+  call so posting never breaks.
+- Quiz explanations are capped at 190 characters to satisfy Telegram's poll
+  explanation limit.
