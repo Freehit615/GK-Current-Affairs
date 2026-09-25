@@ -150,21 +150,39 @@ async def cmd_repeat_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(update, "🔄 Running end-to-end test: fetch → filter → translate → post → quiz…")
     try:
-        result = await scheduler.run_test_cycle(context.bot)
+        status, detail = await scheduler.run_test_cycle(context.bot)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Test cycle failed")
         await reply(update, f"❌ Test failed: {exc}")
         return
 
-    if result is None:
-        await reply(update, "⚠️ No active feed produced a usable item to test with.")
-        return
-
-    await reply(
-        update,
-        "✅ Test post published to content channels.\n"
-        f"🧩 Quiz poll scheduled in {config.QUIZ_DELAY_SECONDS // 60} minute(s).",
-    )
+    if status == "no_feeds":
+        await reply(
+            update,
+            "⚠️ No feeds registered yet. Send a raw feed/API URL to this chat first, "
+            "then run /test again.",
+        )
+    elif status == "fetch_failed":
+        await reply(
+            update,
+            "⚠️ Could not pull any usable content from your feed:\n"
+            f"<code>{detail}</code>\n"
+            "Check the URL is reachable and returns RSS/Atom XML or JSON with a "
+            "recognizable items/articles list.",
+        )
+    elif status == "filtered":
+        await reply(
+            update,
+            "⚠️ Latest item was rejected by the safety filter, so nothing was posted:\n"
+            f"<i>{detail}</i>",
+        )
+    else:  # "posted"
+        await reply(
+            update,
+            "✅ Test post published to content channels:\n"
+            f"<i>{detail}</i>\n"
+            f"🧩 Quiz poll scheduled in {config.QUIZ_DELAY_SECONDS // 60} minute(s).",
+        )
 
 
 # --------------------------------------------------------------------------
