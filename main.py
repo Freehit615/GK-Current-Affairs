@@ -260,19 +260,27 @@ async def get_gemini_usage_today() -> tuple:
     return used, GEMINI_MAX_REQUESTS_PER_DAY
 
 
-async def _call_gemini(**kwargs):
+async def _call_gemini(contents: str, response_mime_type: Optional[str] = None, tools: Optional[list] = None):
     """Reserves a budget/rate slot per attempt, then calls generate_content — trying each
     model in GEMINI_MODEL_CANDIDATES in order. Falls through to the next model on transient
     overload (503/UNAVAILABLE); a 429 quota error aborts immediately (no point retrying or
     switching models — it's an account-level limit)."""
+    config_kwargs = {}
+    if response_mime_type:
+        config_kwargs["response_mime_type"] = response_mime_type
+    if tools:
+        config_kwargs["tools"] = tools
+    config = genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+
     last_exc = None
     for model_name in GEMINI_MODEL_CANDIDATES:
         for attempt in range(1, GEMINI_MAX_RETRIES + 1):
             await _reserve_gemini_slot()
             try:
-                return await asyncio.to_thread(
-                    gemini_client.models.generate_content, model=model_name, **kwargs
-                )
+                kwargs = {"model": model_name, "contents": contents}
+                if config:
+                    kwargs["config"] = config
+                return await asyncio.to_thread(gemini_client.models.generate_content, **kwargs)
             except Exception as e:
                 last_exc = e
                 msg = str(e)
@@ -290,16 +298,41 @@ async def _call_gemini(**kwargs):
 
 
 async def _generate_plain(prompt: str) -> str:
-    response = await _call_gemini(contents=prompt)
+    response = await _call_gemini(prompt)
     return response.text.strip()
 
 
 async def _generate_json(prompt: str) -> str:
-    response = await _call_gemini(
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
-    )
+    response = await _call_gemini(prompt, response_mime_type="application/json")
     return response.text.strip()
+
+
+async def _try_grounded_once(prompt: str) -> Optional[str]:
+    """Single one-shot attempt with Google Search grounding, on the primary model only
+    (grounding can't be combined with response_mime_type=json, so this is plain-text).
+    Costs exactly 1 budget slot. Returns None (never raises) on ANY failure — quota (429),
+    entitlement, or overload — so the caller can fall back to normal non-grounded generation
+    without wasting the whole flow. This keeps the best case (grounding works) at the same
+    total call count as before, and bounds the worst case (grounding unavailable) to +1 call."""
+    model_name = GEMINI_MODEL_CANDIDATES[0]
+    await _reserve_gemini_slot()  # raises GeminiBudgetExceeded if budget is used up — let that propagate as-is
+    try:
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=model_name,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
+            ),
+        )
+        return response.text.strip()
+    except Exception as e:
+        msg = str(e)
+        if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+            logger.warning(f"Grounding not available on this key/tier ({e}); falling back to non-grounded generation.")
+        else:
+            logger.warning(f"Grounded generation failed on {model_name} ({e}); falling back to non-grounded generation.")
+        return None
 
 
 def _extract_json(text: str):
@@ -309,35 +342,52 @@ def _extract_json(text: str):
     return json.loads(text)
 
 
+def _split_bilingual(text: str) -> tuple:
+    """Splits a '===HINDI===\\n...\\n===ENGLISH===\\n...' formatted response into (hindi, english)."""
+    match = re.search(r"===\s*HINDI\s*===\s*(.*?)\s*===\s*ENGLISH\s*===\s*(.*)", text.strip(), re.DOTALL | re.IGNORECASE)
+    if not match:
+        logger.warning("Bilingual split markers not found in Gemini response; treating entire response as Hindi only.")
+        return text.strip(), ""
+    return match.group(1).strip(), match.group(2).strip()
+
+
 async def generate_current_affairs_bilingual(date_str: str) -> dict:
-    """Single Gemini call that returns BOTH Hindi and English bullet-point bodies,
-    to keep daily request count low on the free tier. Returns {"hindi": str, "english": str}."""
+    """Returns BOTH Hindi and English bullet-point bodies. Tries Google Search grounding
+    first (live, current results) in ONE call; if grounding isn't available (quota/entitlement)
+    or fails, falls back to a normal (non-grounded) generation. Returns {"hindi": str, "english": str}."""
     prompt = f"""Tum ek expert current affairs editor ho jo competitive exams (UPSC, SSC, Banking, Railway, State PCS) ke liye content banate ho.
 
-Aaj ki tareekh {date_str} ke liye India aur duniya ki sabसे important, exam-relevant Current Affairs, General Knowledge (GK) aur General Studies (GS) points taiyar karo.
+Aaj ki tareekh {date_str} ke liye India aur duniya ki sabसे important, exam-relevant, VERIFIED aur TAAZA (aaj/kal ki) Current Affairs, General Knowledge (GK) aur General Studies (GS) points taiyar karo. Agar tumhare paas live web search available hai to usse latest, verified news confirm karo.
 
 Requirements:
-- Apne knowledge ke aadhar par sabसे recent aur exam-relevant events cover karo (note: real-time web search available nahi hai, isliye apne training knowledge tak ki sabसे latest verified information do).
 - 8 se 12 crisp bullet points.
 - Har bullet point exam-oriented ho — important facts, names, numbers, dates highlight karo.
 - Categories cover karo jahan relevant ho: National, International, Economy, Sports, Science & Tech, Awards, Appointments, Defence.
 - Har bullet "•" se start ho, koi extra intro/outro nahi.
 - Same content do baar do: ek Hindi mein, ek uska accurate English translation (same facts, same bullet structure).
 
-Return ONLY a JSON object, no markdown, in exactly this format:
-{{
-  "hindi": "• point 1\\n• point 2\\n...",
-  "english": "• point 1\\n• point 2\\n..."
-}}
+Format your ENTIRE response EXACTLY like this (plain text, no markdown, no JSON, no extra commentary):
+===HINDI===
+• point 1
+• point 2
+...
+===ENGLISH===
+• point 1
+• point 2
+...
 """
-    raw_text = await _generate_json(prompt)
-    data = _extract_json(raw_text)
-    return {"hindi": data["hindi"].strip(), "english": data.get("english", "").strip()}
+    raw_text = await _try_grounded_once(prompt)
+    if raw_text is None:
+        raw_text = await _generate_plain(prompt)
+
+    hindi_body, english_body = _split_bilingual(raw_text)
+    return {"hindi": hindi_body, "english": english_body}
 
 
 async def generate_quiz_bilingual(hindi_content: str, english_content: str) -> dict:
-    """Single Gemini call that returns quiz questions in BOTH languages.
-    Returns {"hindi_quiz": [...], "english_quiz": [...]}, each item:
+    """Single Gemini call that returns quiz questions in BOTH languages (no grounding needed —
+    it's based on the already-generated content, not live search). Returns
+    {"hindi_quiz": [...], "english_quiz": [...]}, each item:
     {question, options[4], correct_index, explanation}."""
     prompt = f"""Based ONLY on the following current affairs content, create 3 multiple-choice questions.
 
