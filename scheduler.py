@@ -71,7 +71,10 @@ def _parse_rss(raw_text: str) -> List[Dict[str, str]]:
 
 def _parse_json_api(raw_text: str) -> List[Dict[str, str]]:
     data = json.loads(raw_text)
-    raw_items = data if isinstance(data, list) else data.get("items") or data.get("results") or []
+    raw_items = (
+        data if isinstance(data, list)
+        else data.get("articles") or data.get("items") or data.get("results") or []
+    )
     items = []
     for entry in raw_items:
         if not isinstance(entry, dict):
