@@ -259,19 +259,19 @@ async def _delayed_quiz(bot: Bot, title: str, hindi_text: str, english_text: str
 # --------------------------------------------------------------------------
 # Core pipeline: one feed item -> filtered -> translated -> posted -> quiz scheduled
 # --------------------------------------------------------------------------
-async def process_item(bot: Bot, feed_id: Optional[int], item: Dict[str, str], force: bool = False) -> bool:
+async def process_item(bot: Bot, feed_id: Optional[int], item: Dict[str, str], force: bool = False) -> str:
     """
     Run one content item through the full pipeline.
-    Returns True if it was posted, False if skipped (duplicate/unsafe/empty).
+    Returns one of: "posted", "duplicate", "filtered".
     """
     title, text, guid = item["title"], item.get("text", ""), item["guid"]
 
     if not force and feed_id is not None and await db.item_already_posted(feed_id, guid):
-        return False
+        return "duplicate"
 
     if not is_content_safe(title, text):
         logger.info("Item rejected by safety filter: %s", title[:80])
-        return False
+        return "filtered"
 
     hindi_post, english_post = await build_bilingual_post(title, text)
 
@@ -283,7 +283,7 @@ async def process_item(bot: Bot, feed_id: Optional[int], item: Dict[str, str], f
 
     # Fire-and-forget: quiz poll 2 minutes later, without blocking the caller.
     asyncio.create_task(_delayed_quiz(bot, title, hindi_post, english_post, QUIZ_DELAY_SECONDS))
-    return True
+    return "posted"
 
 
 # --------------------------------------------------------------------------
@@ -297,8 +297,8 @@ async def fetch_all_feeds_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         for item in items:
             if posted_this_feed >= MAX_NEW_ITEMS_PER_FEED_PER_RUN:
                 break
-            posted = await process_item(context.bot, feed["id"], item)
-            if posted:
+            result = await process_item(context.bot, feed["id"], item)
+            if result == "posted":
                 posted_this_feed += 1
 
 
@@ -326,23 +326,34 @@ async def repeat_loop_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # --------------------------------------------------------------------------
 # /test command support
 # --------------------------------------------------------------------------
-async def run_test_cycle(bot: Bot) -> Optional[bool]:
+async def run_test_cycle(bot: Bot) -> Tuple[str, str]:
     """
-    Pull the latest item from the first active feed, force it through the full
-    pipeline (bypassing duplicate-skip so admins can always verify the flow),
-    and return True on success or None if there is no feed/content available.
+    Pull the latest item from the first active feed and force it through the full
+    pipeline (bypassing duplicate-skip so admins can always verify the flow).
+
+    Returns (status, detail):
+      status: "no_feeds"    -> nothing is registered in /del list at all
+              "fetch_failed" -> feed URL returned no usable RSS/JSON items
+              "filtered"     -> an item was found but rejected by the safety filter
+              "posted"       -> full pipeline ran and content was posted
+      detail: human-readable context (feed URL, or item title) for the reply.
     """
     feeds = await db.get_active_feeds()
     if not feeds:
-        return None
+        return "no_feeds", ""
 
     feed = feeds[0]
     items = await fetch_feed_items(feed["url"])
     if not items:
-        return None
+        return "fetch_failed", feed["url"]
 
-    posted = await process_item(bot, feed["id"], items[0], force=True)
-    return True if posted else None
+    item = items[0]
+    result = await process_item(bot, feed["id"], item, force=True)
+
+    if result == "filtered":
+        return "filtered", item["title"][:150]
+
+    return "posted", item["title"][:150]
 
 
 # --------------------------------------------------------------------------
