@@ -107,26 +107,33 @@ All commands reply "⛔ Permission denied" for any user ID not in `ADMIN_IDS`.
 - Uses the `google-genai` SDK with the `gemini-flash-latest` model alias,
   which Google keeps pointed at its current recommended Flash model — no
   manual updates needed when a specific model version is retired.
-- Google Search grounding is **not** used — it requires billing enabled on
-  the Gemini API project and hit `429 RESOURCE_EXHAUSTED` on the free tier.
-  Plain generation runs fine on the free tier, but content quality depends on
-  Gemini's own training data recency rather than live search results. If you
-  later enable billing and want live-search-grounded content, re-add a
-  `google_search` tool call in `_generate_json`/`_generate_plain` in `main.py`.
-- Transient Gemini `503` (server overload) errors trigger an automatic
-  fallback to the next model in `GEMINI_MODELS` (default:
-  `gemini-flash-latest,gemini-3.6-flash`) rather than just retrying the same
-  overloaded model. Set `GEMINI_MODELS` (comma-separated) to customize.
+- **Google Search grounding is enabled** for the current-affairs generation
+  call, so daily posts reflect actual recent events rather than just Gemini's
+  training data. Grounding can't be combined with JSON mode (a hard API
+  limitation), so that one call uses a plain-text `===HINDI===` / `===ENGLISH===`
+  format that's parsed on our side; the quiz call stays JSON since it's based
+  on the already-generated content, not live search.
+- If grounding fails for **any** reason (quota/entitlement `429`, or a
+  transient error), the bot automatically retries the same request without
+  grounding — the post still goes out, just without live search that cycle.
+  This costs at most **1 extra call**; when grounding succeeds (the normal
+  case), there's no extra cost at all.
+- Transient Gemini `503` (server overload) errors on non-grounded calls
+  trigger an automatic fallback to the next model in `GEMINI_MODELS` (default:
+  `gemini-flash-latest,gemini-3.6-flash`). Set `GEMINI_MODELS` (comma-separated)
+  to customize.
 - **Free-tier request budgeting:** the bot is built to run well within a tight
   free-tier quota (as of this deployment: 5 requests/minute, 20 requests/day).
-  Each daily cycle now uses only **2** Gemini calls total (one combined
-  Hindi+English current-affairs call, one combined Hindi+English quiz call) —
-  instead of 4. A daily counter is kept in Postgres (`bot_settings`) and capped
-  at `GEMINI_MAX_REQUESTS_PER_DAY` (default `16`, leaving headroom under a 20/day
-  quota); once hit, further Gemini calls are skipped for the rest of the day
-  rather than erroring out with 429s. Calls are also spaced at least
-  `GEMINI_MIN_SECONDS_BETWEEN_CALLS` seconds apart (default `15s`, i.e. max ~4/min)
-  to stay under a 5/min limit. Both are configurable via env vars if your quota
-  differs. `/status` shows today's usage (`Gemini requests today: X/Y`).
+  Each daily cycle uses **2 Gemini calls in the best case** (1 grounded
+  current-affairs call + 1 quiz call), **up to 5 in the worst case** (grounding
+  fails +1, then the non-grounded retry hits overload and falls back across
+  2 models +1, plus the quiz call's own model fallback +1). A daily counter is
+  kept in Postgres (`bot_settings`) and capped at `GEMINI_MAX_REQUESTS_PER_DAY`
+  (default `16`, leaving headroom under a 20/day quota); once hit, further
+  Gemini calls are skipped for the rest of the day rather than erroring out
+  with 429s. Calls are also spaced at least `GEMINI_MIN_SECONDS_BETWEEN_CALLS`
+  seconds apart (default `15s`, i.e. max ~4/min) to stay under a 5/min limit.
+  Both are configurable via env vars if your quota differs. `/status` shows
+  today's usage (`Gemini requests today: X/Y`).
 - Quiz explanations are capped at 190 characters to satisfy Telegram's poll
   explanation limit.
