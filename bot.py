@@ -90,6 +90,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     await reply(update, text)
 
+    feeds = await db.get_active_feeds()
+    if not feeds:
+        return
+
+    lines = ["🔗 <b>Registered Feeds/APIs</b>"]
+    lines += [f"{i}. <code>{feed['url']}</code>" for i, feed in enumerate(feeds, start=1)]
+
+    # Telegram caps messages at 4096 chars — chunk the list to stay safely under that.
+    chunk, chunk_len = [], 0
+    for line in lines:
+        if chunk_len + len(line) + 1 > 3500:
+            await reply(update, "\n".join(chunk))
+            chunk, chunk_len = [], 0
+        chunk.append(line)
+        chunk_len += len(line) + 1
+    if chunk:
+        await reply(update, "\n".join(chunk))
+    await reply(update, text)
+
 
 @admin_only
 async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
