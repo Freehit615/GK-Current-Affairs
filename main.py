@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 
-from telegram import Bot, BotCommand, Poll, Update
+from telegram import Bot, BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -364,18 +364,18 @@ Aaj ki tareekh {date_str} ke liye India aur duniya ki sabसे important, exam-
 Requirements:
 - 8 se 12 crisp bullet points.
 - Har bullet point exam-oriented ho — important facts, names, numbers, dates highlight karo.
-- Categories cover karo jahan relevant ho: National, International, Economy, Sports, Science & Tech, Awards, Appointments, Defence.
-- Har bullet "•" se start ho, koi extra intro/outro nahi.
-- Same content do baar do: ek Hindi mein, ek uska accurate English translation (same facts, same bullet structure).
+- Har bullet EXACTLY is format mein ho: "• Category: fact text" — Category ek hi English word/phrase ho (National, International, Economy, Sports, Science & Tech, Awards, Appointments, Defence, Environment, Sports, Miscellaneous) jo us fact se best match kare, phir colon, phir fact.
+- Koi extra intro/outro nahi, sirf bullets.
+- Same content do baar do: ek Hindi mein (fact Hindi mein, Category label English mein hi rahega), ek uska accurate English translation (same facts, same bullet structure, same category labels).
 
 Format your ENTIRE response EXACTLY like this (plain text, no markdown, no JSON, no extra commentary):
 ===HINDI===
-• point 1
-• point 2
+• National: fact ...
+• Economy: fact ...
 ...
 ===ENGLISH===
-• point 1
-• point 2
+• National: fact ...
+• Economy: fact ...
 ...
 """
     raw_text = await _try_grounded_once(prompt)
@@ -430,11 +430,57 @@ Rules:
 # --------------------------------------------------------------------------
 
 def build_header(dt: datetime) -> str:
-    # Format: DD Mon-YY — Current Affairs, GK & GS  (e.g. 23 Sep-26 — Current Affairs, GK & GS)
+    # Format: DD Mon-YY (e.g. 23 Sep-26)
     day = dt.strftime("%d")
     mon = dt.strftime("%b")
     yy = dt.strftime("%y")
-    return f"{day} {mon}-{yy} — Current Affairs, GK & GS"
+    return f"{day} {mon}-{yy}"
+
+
+CATEGORY_EMOJI = {
+    "national": "🇮🇳",
+    "international": "🌍",
+    "economy": "💰",
+    "sports": "🏆",
+    "science & tech": "🔬",
+    "science": "🔬",
+    "technology": "🔬",
+    "awards": "🏅",
+    "appointments": "🧑‍💼",
+    "defence": "🛡️",
+    "environment": "🌱",
+    "miscellaneous": "📌",
+}
+
+
+def format_bullets_professional(body: str) -> str:
+    """Transforms '• Category: fact' lines into a professional, spaced-out HTML block
+    with a bold category tag and a matching emoji per line."""
+    lines = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip().lstrip("•").strip()
+        if not line:
+            continue
+        match = re.match(r"^([A-Za-z][A-Za-z &]{1,24}):\s*(.+)$", line)
+        if match:
+            category, fact = match.group(1).strip(), match.group(2).strip()
+            emoji = CATEGORY_EMOJI.get(category.lower(), "▪️")
+            lines.append(f"{emoji} <b>{category}:</b> {fact}")
+        else:
+            lines.append(f"▪️ {line}")
+    return "\n\n".join(lines)
+
+
+def build_current_affairs_post(header: str, title_line: str, body: str) -> str:
+    formatted_body = format_bullets_professional(body)
+    divider = "━" * 22
+    return (
+        f"📅 <b>{header}</b>\n"
+        f"🗞 <b>{title_line}</b>\n"
+        f"{divider}\n\n"
+        f"{formatted_body}\n\n"
+        f"{divider}"
+    )
 
 
 async def run_current_affairs_flow(app: Application):
@@ -453,7 +499,7 @@ async def run_current_affairs_flow(app: Application):
         logger.error(f"Gemini bilingual generation failed: {e}")
         return
 
-    hindi_post = f"<b>{header}</b>\n\n{hindi_body}"
+    hindi_post = build_current_affairs_post(header, "करेंट अफेयर्स | GK & GS", hindi_body)
     try:
         msg = await app.bot.send_message(
             chat_id=Config.HINDI_CHANNEL_ID, text=hindi_post, parse_mode=ParseMode.HTML
@@ -465,7 +511,7 @@ async def run_current_affairs_flow(app: Application):
         return
 
     if english_body:
-        english_post = f"<b>{header}</b>\n\n{english_body}"
+        english_post = build_current_affairs_post(header, "Current Affairs | GK & GS", english_body)
         try:
             msg = await app.bot.send_message(
                 chat_id=Config.ENGLISH_CHANNEL_ID, text=english_post, parse_mode=ParseMode.HTML
@@ -482,27 +528,41 @@ async def run_current_affairs_flow(app: Application):
         run_quiz_flow,
         trigger="date",
         run_date=run_at,
-        args=[app, hindi_body, english_body],
+        args=[app, header, hindi_body, english_body],
         id=f"quiz_job_{now_ist.strftime('%Y%m%d%H%M%S')}",
         misfire_grace_time=600,
     )
     logger.info(f"Quiz job scheduled for {run_at.isoformat()}")
 
 
-async def _send_quiz_poll(app: Application, chat_id: str, q: dict):
-    options = q["options"]
-    await app.bot.send_poll(
-        chat_id=chat_id,
-        question=q["question"][:300],
-        options=[opt[:100] for opt in options],
-        type=Poll.QUIZ,
-        correct_option_id=int(q["correct_index"]),
-        explanation=(q.get("explanation") or "")[:190],
-        is_anonymous=True,
-    )
+def build_quiz_message(title_line: str, questions: list) -> str:
+    """Builds ONE message containing all quiz questions, with the answer + explanation
+    hidden behind a Telegram spoiler tag (tap to reveal) instead of separate native polls."""
+    letters = ["A", "B", "C", "D"]
+    divider = "━" * 22
+    lines = [f"🧠 <b>{title_line}</b>", divider, ""]
+    for idx, q in enumerate(questions, start=1):
+        options = q.get("options", [])
+        lines.append(f"<b>Q{idx}.</b> {q.get('question', '').strip()}")
+        for i, opt in enumerate(options[:4]):
+            lines.append(f"   {letters[i]}) {opt}")
+        try:
+            correct_idx = int(q.get("correct_index", 0))
+            correct_letter = letters[correct_idx]
+            correct_text = options[correct_idx]
+        except (ValueError, IndexError, TypeError):
+            correct_letter, correct_text = "?", ""
+        explanation = (q.get("explanation") or "").strip()
+        reveal = f"✅ Answer: {correct_letter}) {correct_text}"
+        if explanation:
+            reveal += f"\n💡 {explanation}"
+        lines.append(f"<tg-spoiler>{reveal}</tg-spoiler>")
+        lines.append("")
+    lines.append(divider)
+    return "\n".join(lines).strip()
 
 
-async def run_quiz_flow(app: Application, hindi_body: str, english_body: Optional[str]):
+async def run_quiz_flow(app: Application, header: str, hindi_body: str, english_body: Optional[str]):
     try:
         quiz = await generate_quiz_bilingual(hindi_body, english_body or "")
     except GeminiBudgetExceeded as e:
@@ -512,18 +572,25 @@ async def run_quiz_flow(app: Application, hindi_body: str, english_body: Optiona
         logger.error(f"Quiz generation failed: {e}")
         return
 
-    try:
-        for q in quiz.get("hindi_quiz", []):
-            await _send_quiz_poll(app, Config.HINDI_QUIZ_CHANNEL_ID, q)
-        logger.info(f"Posted {len(quiz.get('hindi_quiz', []))} Hindi quiz questions.")
-    except Exception as e:
-        logger.error(f"Posting Hindi quiz failed: {e}")
-
-    if english_body:
+    hindi_questions = quiz.get("hindi_quiz", [])
+    if hindi_questions:
         try:
-            for q in quiz.get("english_quiz", []):
-                await _send_quiz_poll(app, Config.ENGLISH_QUIZ_CHANNEL_ID, q)
-            logger.info(f"Posted {len(quiz.get('english_quiz', []))} English quiz questions.")
+            text = build_quiz_message(f"{header} — Quiz", hindi_questions)
+            await app.bot.send_message(
+                chat_id=Config.HINDI_QUIZ_CHANNEL_ID, text=text, parse_mode=ParseMode.HTML
+            )
+            logger.info(f"Posted combined Hindi quiz ({len(hindi_questions)} questions) as one message.")
+        except Exception as e:
+            logger.error(f"Posting Hindi quiz failed: {e}")
+
+    english_questions = quiz.get("english_quiz", [])
+    if english_body and english_questions:
+        try:
+            text = build_quiz_message(f"{header} — Quiz", english_questions)
+            await app.bot.send_message(
+                chat_id=Config.ENGLISH_QUIZ_CHANNEL_ID, text=text, parse_mode=ParseMode.HTML
+            )
+            logger.info(f"Posted combined English quiz ({len(english_questions)} questions) as one message.")
         except Exception as e:
             logger.error(f"Posting English quiz failed: {e}")
 
