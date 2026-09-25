@@ -89,32 +89,59 @@ def _parse_json_api(raw_text: str) -> List[Dict[str, str]]:
     return items
 
 
-async def fetch_feed_items(url: str) -> List[Dict[str, str]]:
+async def fetch_feed_with_diagnostics(url: str) -> Tuple[List[Dict[str, str]], bool, str]:
     """
-    Fetch and normalize content items from a feed/API URL.
-    Tries RSS/Atom first (via feedparser), falls back to generic JSON parsing.
-    Returns a list of {guid, title, text} dicts, newest-first as provided by the source.
+    Fetch + parse a feed/API URL. Returns (items, is_working, message).
+
+    is_working is True when the endpoint is reachable and returned a
+    recognizable structure (RSS/Atom, or JSON with an articles/items/results
+    list) -- even if there happen to be zero new items right now.
+    is_working is False when the request failed outright, the response
+    could not be parsed at all, or the payload looks like an API error
+    (e.g. an invalid NewsAPI key returns valid JSON but no article list).
     """
     try:
         raw_text = await _http_get(url)
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to fetch feed %s: %s", url, exc)
-        return []
+        return [], False, f"Unreachable: {exc}"
 
     loop = asyncio.get_running_loop()
-    try:
-        items = await loop.run_in_executor(None, _parse_rss, raw_text)
-        if items:
-            return items
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("RSS parse failed for %s: %s", url, exc)
 
     try:
-        items = await loop.run_in_executor(None, _parse_json_api, raw_text)
-        return items
+        rss_items = await loop.run_in_executor(None, _parse_rss, raw_text)
+    except Exception:  # noqa: BLE001
+        rss_items = []
+    if rss_items:
+        return rss_items, True, "OK (RSS/Atom)"
+
+    try:
+        data = json.loads(raw_text)
+    except Exception:  # noqa: BLE001
+        return [], False, "Unrecognized response (not valid RSS/Atom or JSON)"
+
+    # Common "API key invalid / quota exceeded" style error payloads (e.g. NewsAPI).
+    if isinstance(data, dict) and str(data.get("status", "")).lower() == "error":
+        return [], False, str(data.get("message") or "API returned an error response")
+
+    raw_list = data if isinstance(data, list) else None
+    if raw_list is None and isinstance(data, dict):
+        raw_list = data.get("articles") or data.get("items") or data.get("results")
+
+    if raw_list is None:
+        return [], False, "Unrecognized JSON structure (no articles/items/results list)"
+
+    try:
+        json_items = await loop.run_in_executor(None, _parse_json_api, raw_text)
     except Exception as exc:  # noqa: BLE001
-        logger.error("JSON parse failed for %s: %s", url, exc)
-        return []
+        return [], False, f"JSON parse error: {exc}"
+
+    return json_items, True, "OK (JSON API)"
+
+
+async def fetch_feed_items(url: str) -> List[Dict[str, str]]:
+    """Backward-compatible wrapper around fetch_feed_with_diagnostics (items only)."""
+    items, _, _ = await fetch_feed_with_diagnostics(url)
+    return items
 
 
 # --------------------------------------------------------------------------
@@ -291,8 +318,21 @@ async def process_item(bot: Bot, feed_id: Optional[int], item: Dict[str, str], f
 # --------------------------------------------------------------------------
 async def fetch_all_feeds_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     feeds = await db.get_active_feeds()
+    if not feeds:
+        return
+
+    working: List[str] = []
+    failed: List[Tuple[str, str]] = []
+
     for feed in feeds:
-        items = await fetch_feed_items(feed["url"])
+        items, is_working, message = await fetch_feed_with_diagnostics(feed["url"])
+
+        if is_working:
+            working.append(feed["url"])
+        else:
+            failed.append((feed["url"], message))
+            continue  # nothing usable — skip straight to the next feed
+
         posted_this_feed = 0
         for item in items:
             if posted_this_feed >= MAX_NEW_ITEMS_PER_FEED_PER_RUN:
@@ -300,6 +340,32 @@ async def fetch_all_feeds_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             result = await process_item(context.bot, feed["id"], item)
             if result == "posted":
                 posted_this_feed += 1
+
+    await send_feed_health_report(context.bot, working, failed)
+
+
+async def send_feed_health_report(bot: Bot, working: List[str], failed: List[Tuple[str, str]]) -> None:
+    """Notify every admin how many registered feeds/APIs are currently working vs failing."""
+    total = len(working) + len(failed)
+    if total == 0:
+        return
+
+    lines = [
+        "📡 <b>Feed/API Health Report</b>",
+        f"Checked: <b>{total}</b>  |  ✅ Working: <b>{len(working)}</b>  |  ❌ Failed: <b>{len(failed)}</b>",
+    ]
+    if failed:
+        lines.append("")
+        lines.append("❌ <b>Failing (ignored this run):</b>")
+        for url, reason in failed:
+            lines.append(f"• <code>{url}</code>\n   ↳ {reason}")
+
+    text = "\n".join(lines)
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=admin_id, text=text, parse_mode=ParseMode.HTML)
+        except TelegramError as exc:
+            logger.error("Failed to send feed health report to admin %s: %s", admin_id, exc)
 
 
 # --------------------------------------------------------------------------
@@ -343,9 +409,9 @@ async def run_test_cycle(bot: Bot) -> Tuple[str, str]:
         return "no_feeds", ""
 
     feed = feeds[0]
-    items = await fetch_feed_items(feed["url"])
-    if not items:
-        return "fetch_failed", feed["url"]
+    items, is_working, message = await fetch_feed_with_diagnostics(feed["url"])
+    if not is_working or not items:
+        return "fetch_failed", f"{feed['url']} — {message}"
 
     item = items[0]
     result = await process_item(bot, feed["id"], item, force=True)
