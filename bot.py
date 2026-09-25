@@ -14,7 +14,7 @@ import re
 import asyncio
 from functools import wraps
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -179,10 +179,21 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --------------------------------------------------------------------------
 # App bootstrap
 # --------------------------------------------------------------------------
+BOT_COMMANDS = [
+    BotCommand("start", "Authorization check & status message"),
+    BotCommand("status", "DB health, feeds, channels, repeat status"),
+    BotCommand("del", "Delete a feed/API link — /del <url>"),
+    BotCommand("repeat_on", "Enable revision loop — /repeat_on [days]"),
+    BotCommand("repeat_off", "Disable revision loop"),
+    BotCommand("test", "Run full fetch → post → quiz flow now"),
+]
+
+
 async def post_init(application: Application) -> None:
     await db.init_db()
     scheduler.register_jobs(application)
-    logger.info("Bot initialized: schema ready, scheduler jobs registered.")
+    await application.bot.set_my_commands(BOT_COMMANDS)
+    logger.info("Bot initialized: schema ready, scheduler jobs registered, command menu set.")
 
 
 async def post_shutdown(application: Application) -> None:
