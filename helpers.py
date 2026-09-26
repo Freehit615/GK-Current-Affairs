@@ -277,6 +277,10 @@ def build_input_media_poll(shuffled: ShuffledQuiz) -> InputMediaPoll:
         public_voters=False,
         multiple_choice=shuffled.multiple_choice,
         quiz=shuffled.is_quiz,
+        # Newer Telethon/TL layers require `hash` on Poll (used server-side
+        # to detect option changes on edits). For a freshly-built poll being
+        # sent for the first time, 0 is a valid placeholder.
+        hash=0,
     )
 
     correct_answers = None
