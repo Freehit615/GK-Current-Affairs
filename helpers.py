@@ -23,9 +23,11 @@ import copy
 import logging
 import random
 import re
+import struct
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from telethon.tl.tlobject import TLObject
 from telethon.tl.types import (
     InputMediaPoll,
     Message,
@@ -262,7 +264,77 @@ def extract_and_shuffle(message: Message) -> ShuffledQuiz:
     )
 
 
-def build_input_media_poll(shuffled: ShuffledQuiz) -> InputMediaPoll:
+class _InputMediaPollFixed(TLObject):
+    """
+    Telethon's own `InputMediaPoll` (as of the version pinned in
+    requirements.txt) still serializes `correct_answers` per an *obsolete*
+    TL layer (constructor 0x883a4108): a Vector<int> of 0-based answer
+    indices, plus unused `attached_media`/`solution_media` fields.
+
+    Telegram's *current* live server schema for this constructor is
+    `inputMediaPoll#f94e5f1` — a Vector<bytes> of the correct answers'
+    literal `option` identifiers (see core.telegram.org/constructor/
+    inputMediaPoll, no layer pinned = current). Sending the old int-index
+    form is accepted at the transport level (so it doesn't crash) but
+    Telegram rejects it with QuizCorrectAnswerInvalidError because it
+    doesn't decode to a real option's bytes.
+
+    This class hand-encodes the *current* wire format so quiz polls with
+    a correct answer actually work, without needing to upgrade/patch
+    Telethon itself (which is now archived/unmaintained upstream).
+    """
+
+    CONSTRUCTOR_ID = 0xF94E5F1
+    SUBCLASS_OF_ID = 0xFAF846F4  # crc32(b'InputMedia') — same as Telethon's InputMediaPoll
+
+    def __init__(
+        self,
+        poll: "Poll",
+        correct_answers: list[bytes] | None = None,
+        solution: str | None = None,
+        solution_entities: list | None = None,
+    ):
+        self.poll = poll
+        self.correct_answers = correct_answers
+        self.solution = solution
+        self.solution_entities = solution_entities or []
+
+    def to_dict(self):
+        return {
+            "_": "InputMediaPoll",
+            "poll": self.poll.to_dict() if isinstance(self.poll, TLObject) else self.poll,
+            "correct_answers": self.correct_answers,
+            "solution": self.solution,
+            "solution_entities": [
+                x.to_dict() if isinstance(x, TLObject) else x for x in (self.solution_entities or [])
+            ],
+        }
+
+    def _bytes(self) -> bytes:
+        has_correct = bool(self.correct_answers)
+        has_solution = self.solution is not None
+        flags = (1 if has_correct else 0) | (2 if has_solution else 0)
+
+        parts = [
+            struct.pack("<I", self.CONSTRUCTOR_ID),
+            struct.pack("<I", flags),
+            self.poll._bytes(),
+        ]
+        if has_correct:
+            parts.append(b"\x15\xc4\xb5\x1c")  # Vector<> marker
+            parts.append(struct.pack("<i", len(self.correct_answers)))
+            for opt in self.correct_answers:
+                parts.append(self.serialize_bytes(opt))
+        if has_solution:
+            parts.append(self.serialize_bytes(self.solution))
+            parts.append(b"\x15\xc4\xb5\x1c")
+            parts.append(struct.pack("<i", len(self.solution_entities)))
+            for ent in self.solution_entities:
+                parts.append(ent._bytes())
+        return b"".join(parts)
+
+
+def build_input_media_poll(shuffled: ShuffledQuiz) -> TLObject:
     """Turn a ShuffledQuiz back into something Telethon can send."""
     answers = [
         PollAnswer(text=TextWithEntities(text=opt, entities=[]), option=bytes([i]))
@@ -283,16 +355,15 @@ def build_input_media_poll(shuffled: ShuffledQuiz) -> InputMediaPoll:
         hash=0,
     )
 
-    correct_answers = None
+    correct_answers: list[bytes] | None = None
     if shuffled.is_quiz and shuffled.correct_index is not None:
-        # This Telethon/TL layer packs correct_answers as raw ints
-        # (struct.pack('<i', x)), not as option byte-strings.
-        correct_answers = [shuffled.correct_index]
+        # Current Telegram schema wants the correct answer's literal
+        # `option` byte-string(s), not a positional index.
+        correct_answers = [answers[shuffled.correct_index].option]
 
-    solution_entities: list = []
-    return InputMediaPoll(
+    return _InputMediaPollFixed(
         poll=new_poll,
         correct_answers=correct_answers,
         solution=shuffled.explanation or None,
-        solution_entities=solution_entities if shuffled.explanation else None,
+        solution_entities=[] if shuffled.explanation else None,
     )
