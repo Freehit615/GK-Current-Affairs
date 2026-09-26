@@ -37,6 +37,20 @@ def _optional_int(name: str, default: int | None = None) -> int | None:
         raise ConfigError(f"{name} must be an integer, got: {raw!r}") from exc
 
 
+def _require_session_string() -> str:
+    value = _require("SESSION_STRING").strip()
+    # A real Telethon StringSession is always well over 100 characters.
+    # Catching a truncated/blank value here gives a much clearer error
+    # than Telethon's generic "Not a valid string" deep in userbot.py.
+    if len(value) < 100:
+        raise ConfigError(
+            "SESSION_STRING looks truncated or empty "
+            f"({len(value)} chars, expected 100+). Regenerate it and make sure "
+            "you copy the ENTIRE printed string, with no extra spaces/newlines."
+        )
+    return value
+
+
 def _parse_admin_ids(raw: str) -> frozenset[int]:
     ids: set[int] = set()
     for chunk in raw.split(","):
@@ -89,7 +103,7 @@ def load_config() -> Config:
         api_id=api_id,
         api_hash=_require("API_HASH"),
         bot_token=_require("BOT_TOKEN"),
-        session_string=_require("SESSION_STRING"),
+        session_string=_require_session_string(),
         post_channel_id=int(_require("POST_CHANNEL_ID")),
         quiz_channel_id=int(_require("QUIZ_CHANNEL_ID")),
         admins=_parse_admin_ids(_require("ADMINS")),
