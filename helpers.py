@@ -285,7 +285,9 @@ def build_input_media_poll(shuffled: ShuffledQuiz) -> InputMediaPoll:
 
     correct_answers = None
     if shuffled.is_quiz and shuffled.correct_index is not None:
-        correct_answers = [bytes([shuffled.correct_index])]
+        # This Telethon/TL layer packs correct_answers as raw ints
+        # (struct.pack('<i', x)), not as option byte-strings.
+        correct_answers = [shuffled.correct_index]
 
     solution_entities: list = []
     return InputMediaPoll(
